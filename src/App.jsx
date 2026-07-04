@@ -340,6 +340,7 @@ export default function TFAudit() {
       if (fileData?.isPdf) {
         addLog("Extraction du texte PDF…");
         text = await extractPdfText(fileData.base64);
+        console.log('RAW PDF TEXT:', text);
         addLog(`${text.length} caractères extraits`);
       } else {
         addLog("Mode démonstration (SCI Place de la Croix)");
