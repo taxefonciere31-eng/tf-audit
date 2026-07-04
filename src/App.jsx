@@ -22,32 +22,71 @@ async function extractPdfText(base64) {
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
-    text += content.items.map(x => x.str).join(" ") + "\n";
+    text += reconstructLines(content.items) + "\n";
   }
   return text;
+}
+
+// PDF.js returns items in content-stream order, NOT reading order. On a
+// multi-column table (Commune / Syndicat / Interco / OM / GEMAPI side by
+// side) a naive join() interleaves cells and the regexes below match the
+// wrong numbers. We rebuild real rows using each item's y position (line)
+// then sort left-to-right by x within that line before joining.
+function reconstructLines(items) {
+  const Y_TOLERANCE = 2;
+  const rows = [];
+  for (const it of items) {
+    if (!it.str || !it.str.trim()) continue;
+    const x = it.transform[4];
+    const y = it.transform[5];
+    let row = rows.find(r => Math.abs(r.y - y) <= Y_TOLERANCE);
+    if (!row) { row = { y, items: [] }; rows.push(row); }
+    row.items.push({ x, str: it.str });
+  }
+  rows.sort((a, b) => b.y - a.y); // PDF y-axis grows upward: top of page first
+  return rows
+    .map(r => r.items.sort((a, b) => a.x - b.x).map(i => i.str).join(" "))
+    .join("\n");
 }
 
 // ---- Pure JS extraction from PDF text ----
 function parseNum(str) {
   if (!str) return null;
-  const n = parseFloat(str.replace(/\s/g, "").replace(",", "."));
+  // French formatting: spaces / narrow no-break spaces as thousand separators, comma as decimal
+  const cleaned = str.replace(/[\s  ]/g, "").replace(",", ".");
+  const n = parseFloat(cleaned);
   return isNaN(n) ? null : n;
 }
 
+const PCT_RE = /(\d{1,3}[,\.]\d{1,3})\s*%/;
+// IMPORTANT: no \s inside the digit run. A "Base" row on the avis often has
+// several distinct columns on one line ("936 898 898 898 898 €" = commune,
+// EPCI, OM, syndicat, GEMAPI). A regex that tolerates spaces between digits
+// (to allow French thousand-separators) ends up swallowing all of them into
+// one giant number instead of stopping at the first value. These amounts
+// are small enough (a few thousand euros max) that a plain contiguous digit
+// run is safer than trying to guess where a real separator ends.
+const NUM_RE = /(\d+(?:[,\.]\d{1,2})?)\s*€?/;
+// Grabs every distinct number on a line — used for multi-column rows like "Base".
+const ALL_NUMS_RE = /\d+(?:[,\.]\d{1,2})?/g;
+
+// Search line-by-line for a label, then pull the first matching value on
+// that same line or within the next couple of lines (handles wrapped /
+// multi-line table cells where label and value land on separate rows).
+function findValue(lines, labelPatterns, valueRe, aheadLines = 2) {
+  for (let i = 0; i < lines.length; i++) {
+    if (!labelPatterns.some(p => p.test(lines[i]))) continue;
+    for (let j = 0; j <= aheadLines && i + j < lines.length; j++) {
+      const m = lines[i + j].match(valueRe);
+      if (m) return m[1];
+    }
+  }
+  return null;
+}
+
 function extractData(text) {
+  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
   const t = text.replace(/\s+/g, " ");
-
-  // Helper: find number after keyword
-  const after = (kw, offset = 0) => {
-    const re = new RegExp(kw + "[\\s:]*([\\d\\s,\\.]+)", "i");
-    const m = t.match(re);
-    if (!m) return null;
-    return parseNum(m[1 + offset]);
-  };
-
-  // Helper: find percentage (e.g. "50,48 %")
-  const allPcts = [...t.matchAll(/(\d{1,3}[,\.]\d{1,3})\s*%/g)].map(m => parseNum(m[1]) / 100);
-  const allInts = [...t.matchAll(/\b(\d{2,6})\b/g)].map(m => parseInt(m[1]));
 
   // Propriétaire
   const proprioMatch = t.match(/SCI\s+[\w\s]+|SARL\s+[\w\s]+|SAS\s+[\w\s]+|EURL\s+[\w\s]+|M[MR]\.\s+[\w\s]+/i);
@@ -70,42 +109,74 @@ function extractData(text) {
   const anneeMatch = t.match(/Taxes fonci.res\s+(\d{4})/i) || t.match(/pour\s+(\d{4})/i);
   const annee = anneeMatch ? parseInt(anneeMatch[1]) : 2025;
 
-  // Taux — look for pattern "50,48 %" in sequence commune/interco/OM/syndicats/GEMAPI
-  // On the DGFiP avis, taux appear twice (2024 row then 2025 row)
-  // We want taux 2025 (second occurrence of each)
-  const tauxAll = [...t.matchAll(/(\d{1,3}[,\.]\d{2,3})\s*%/g)].map(m => parseNum(m[1]) / 100);
-  
-  // Typically: taux commune 2024, taux commune 2025, taux interco 2024, taux interco 2025...
-  // But layout varies — use positional heuristic
-  const tauxCommune = tauxAll.length > 0 ? tauxAll[0] : null;
-  const tauxEPCI = tauxAll.length > 2 ? tauxAll[2] : null;
-  const tauxOM = tauxAll.length > 4 ? tauxAll[4] : null;
-  const tauxSyndicats = tauxAll.length > 6 ? tauxAll[6] : null;
-  const tauxGEMAPI = tauxAll.length > 8 ? tauxAll[8] : null;
+  // ---- Taux, per collectivité — label-anchored first, positional as fallback ----
+  const tauxCommuneStr = findValue(lines, [/taux\s+commun/i], PCT_RE);
+  const tauxSyndicatsStr = findValue(lines, [/taux\s+syndicat/i], PCT_RE);
+  const tauxEPCIStr = findValue(lines, [/taux\s+interco/i, /taux\s+intercommunal/i, /\bEPCI\b/i], PCT_RE);
+  const tauxOMStr = findValue(lines, [/taux\s+OM\b/i, /ordures\s+m[ée]nag/i], PCT_RE);
+  const tauxGEMAPIStr = findValue(lines, [/GEMAPI/i], PCT_RE);
 
-  // Bases — integers in the 100–99999 range appearing after "Base" context
-  const baseMatch = t.match(/Base\s+(\d{3,6})/i);
-  const baseCommune = baseMatch ? parseInt(baseMatch[1]) : null;
+  let tauxCommune = tauxCommuneStr ? parseNum(tauxCommuneStr) / 100 : null;
+  let tauxSyndicats = tauxSyndicatsStr ? parseNum(tauxSyndicatsStr) / 100 : null;
+  let tauxEPCI = tauxEPCIStr ? parseNum(tauxEPCIStr) / 100 : null;
+  let tauxOM = tauxOMStr ? parseNum(tauxOMStr) / 100 : null;
+  let tauxGEMAPI = tauxGEMAPIStr ? parseNum(tauxGEMAPIStr) / 100 : null;
 
-  // Cotisations — look for Cotisation 2024 / 2025
-  const cotis2024Match = t.match(/Cotisation\s+2024.*?(\d{3,5})/i)
-    || t.match(/2024.*?(\d{3,5})\s/);
-  const cotisationCommune2024 = cotis2024Match ? parseInt(cotis2024Match[1]) : null;
+  // Fallback: no labels found (raw/unlabelled layout) — use positional order
+  // of every "%" occurrence in the doc, best-effort only.
+  if (tauxCommune == null && tauxEPCI == null && tauxOM == null) {
+    const tauxAll = [...t.matchAll(/(\d{1,3}[,\.]\d{1,3})\s*%/g)].map(m => parseNum(m[1]) / 100);
+    tauxCommune = tauxAll[0] ?? null;
+    tauxEPCI = tauxAll[2] ?? tauxAll[1] ?? null;
+    tauxOM = tauxAll[4] ?? null;
+    tauxSyndicats = tauxAll[6] ?? null;
+    tauxGEMAPI = tauxAll[8] ?? null;
+  }
 
-  const cotis2025Match = t.match(/Cotisation\s+2025.*?(\d{3,5})/i)
-    || t.match(/Cotisation\s+liss.e.*?(\d{3,5})/i);
-  const cotisationLisseeCommune2025 = cotis2025Match ? parseInt(cotis2025Match[1]) : null;
+  // ---- Base d'imposition ----
+  // A "Base" row can hold up to 5 columns (Commune / EPCI / OM / Syndicat /
+  // GEMAPI) on the same line. Grab every number on that line, not just the
+  // first, and map them positionally instead of assuming one shared value.
+  let baseCommune = null, baseEPCI = null, baseOM = null, baseSyndicats = null, baseGEMAPI = null;
+  const baseLineIdx = lines.findIndex(l => /^base\b/i.test(l) || /base\s+d.imposition/i.test(l));
+  if (baseLineIdx !== -1) {
+    const baseNums = (lines[baseLineIdx].match(ALL_NUMS_RE) || []).map(parseNum);
+    if (baseNums.length >= 5) {
+      [baseCommune, baseEPCI, baseOM, baseSyndicats, baseGEMAPI] = baseNums;
+    } else if (baseNums.length >= 1) {
+      // Single shared base for the whole property — apply to every collectivité.
+      baseCommune = baseEPCI = baseOM = baseSyndicats = baseGEMAPI = baseNums[0];
+    }
+  } else {
+    const baseFallback = (t.match(/Base\s*:?\s*(\d+(?:[,\.]\d{1,2})?)\s*€/i) || [])[1];
+    if (baseFallback) baseCommune = baseEPCI = baseOM = baseSyndicats = baseGEMAPI = parseNum(baseFallback);
+  }
+  baseCommune = baseCommune != null ? Math.round(baseCommune) : null;
+  const baseIntercommunalite = baseEPCI != null ? Math.round(baseEPCI) : baseCommune;
 
-  // Montant total
-  const montantMatch = t.match(/Montant\s+de\s+votre\s+imp.t\s+(\d{3,6})/i)
-    || t.match(/Somme\s+.+\s+(\d{3,6}[,\.]?\d{0,2})\s*€/i);
-  const montantTotal = montantMatch ? parseNum(montantMatch[1]) : null;
+  // ---- Cotisations N-1 / N (e.g. "Cotisation 2024 : 3510€ / Cotisation 2025 : 3510€") ----
+  const cotisPairMatch = t.match(/Cotisation\s*(\d{4})[^\d€]*(\d+(?:[,\.]\d{1,2})?)\s*€.{0,30}?Cotisation\s*(\d{4})[^\d€]*(\d+(?:[,\.]\d{1,2})?)\s*€/i);
+  let cotisationCommune2024 = null, cotisationLisseeCommune2025 = null;
+  if (cotisPairMatch) {
+    cotisationCommune2024 = Math.round(parseNum(cotisPairMatch[2]));
+    cotisationLisseeCommune2025 = Math.round(parseNum(cotisPairMatch[4]));
+  } else {
+    const c24 = findValue(lines, [/Cotisation\s*2024/i], NUM_RE);
+    const c25 = findValue(lines, [/Cotisation\s*2025/i, /Cotisation\s+liss.e/i], NUM_RE);
+    cotisationCommune2024 = c24 ? Math.round(parseNum(c24)) : null;
+    cotisationLisseeCommune2025 = c25 ? Math.round(parseNum(c25)) : null;
+  }
 
-  // Frais gestion
-  const fraisMatch = t.match(/Frais\s+de\s+gestion.*?(\d{1,4})/i);
-  const fraisGestion = fraisMatch ? parseInt(fraisMatch[1]) : null;
+  // ---- Montant total ----
+  const montantStr = findValue(lines, [/Montant\s+de\s+votre\s+imp.t/i, /Montant\s+total/i], NUM_RE)
+    || (t.match(/Somme\s+.+?(\d+(?:[,\.]\d{1,2})?)\s*€/i) || [])[1];
+  const montantTotal = montantStr ? parseNum(montantStr) : null;
 
-  // Lissage
+  // ---- Frais de gestion ----
+  const fraisStr = findValue(lines, [/Frais\s+de\s+gestion/i], NUM_RE);
+  const fraisGestion = fraisStr ? Math.round(parseNum(fraisStr)) : null;
+
+  // ---- Lissage ----
   const lissageMatch = t.match(/lissage\s+de\s+\+?\s*(\d+)\s*€?\s*par\s+an/i)
     || t.match(/lissage.*?(\d+)\s*€\s*par\s+an/i);
   const lissage = !!lissageMatch || /lissage/i.test(t);
@@ -117,7 +188,7 @@ function extractData(text) {
 
   return {
     entreprise, adresse, commune, departement, annee,
-    baseCommune, baseIntercommunalite: baseCommune,
+    baseCommune, baseIntercommunalite,
     tauxCommune, tauxEPCI, tauxOM, tauxSyndicats, tauxGEMAPI,
     cotisationCommune2024, cotisationLisseeCommune2025,
     montantTotal, fraisGestion,
@@ -185,7 +256,7 @@ function eur(n) {
 }
 function pct(n) {
   if (n == null || isNaN(n)) return "—";
-  return (n * 100).toFixed(2).replace(".", ",") + "\u202f%";
+  return (n * 100).toFixed(2).replace(".", ",") + " %";
 }
 
 function ScoreBadge({ score }) {
@@ -231,15 +302,23 @@ function Row({ label, value, flag }) {
   );
 }
 
+const TYPES_BIEN = ["Appartement", "Maison", "Local commercial", "Bureau", "Autre"];
+const ETATS_BIEN = ["Bon état", "État moyen", "Vétuste / à rénover"];
+const EMPTY_BIEN = { superficie: "", type: "", etat: "", dpe: "", anneeConstruction: "" };
+
 // ---- Main component ----
 export default function TFAudit() {
   const [phase, setPhase] = useState("upload");
   const [fileName, setFileName] = useState(null);
   const [fileData, setFileData] = useState(null);
   const [log, setLog] = useState([]);
+  const [extracted, setExtracted] = useState(null); // raw parsed data, before bien-form
+  const [bien, setBien] = useState(EMPTY_BIEN);
   const [result, setResult] = useState(null);
   const [letter, setLetter] = useState(null);
   const [errorMsg, setErrorMsg] = useState(null);
+  const [leadEmail, setLeadEmail] = useState("");
+  const [leadSent, setLeadSent] = useState(false);
 
   const addLog = msg => setLog(p => [...p, msg]);
 
@@ -253,6 +332,7 @@ export default function TFAudit() {
     reader.readAsDataURL(f);
   }
 
+  // Étape 1 : upload + extraction du PDF, puis on passe au formulaire court (étape 2)
   async function run() {
     setPhase("running"); setLog([]); setResult(null); setLetter(null); setErrorMsg(null);
     try {
@@ -263,7 +343,6 @@ export default function TFAudit() {
         addLog(`${text.length} caractères extraits`);
       } else {
         addLog("Mode démonstration (SCI Place de la Croix)");
-        // Inject real demo data directly
         text = "DEMO";
       }
 
@@ -284,71 +363,100 @@ export default function TFAudit() {
         d = extractData(text);
       }
 
-      addLog("Vérifications arithmétiques…");
-      const baseC = d.baseCommune || 0;
-      const baseI = d.baseIntercommunalite || baseC;
-      const cotisC = d.tauxCommune ? Math.round(baseC * d.tauxCommune) : null;
-      const cotisReste = Math.round(baseI * ((d.tauxEPCI||0)+(d.tauxOM||0)+(d.tauxSyndicats||0)+(d.tauxGEMAPI||0)));
-      const totalRecalc = cotisC != null ? cotisC + cotisReste + (d.fraisGestion||0) : null;
-      const ecartMontant = totalRecalc != null && d.montantTotal ? d.montantTotal - totalRecalc : null;
-      const revaloOff = d.annee === 2025 ? 0.039 : 0.008;
-      const c24 = d.cotisationCommune2024, c25 = d.cotisationLisseeCommune2025;
-      const evo = c24 && c25 ? (c25 - c24) / c24 : null;
-      const ecartEvo = evo != null ? evo - revaloOff : null;
-
-      const checks = [];
-      let score = 0;
-
-      if (d.lissage) {
-        score += 30;
-        checks.push({ id: "lissage", status: "flag", label: "Lissage actif détecté",
-          detail: `+${d.lissageMontantAnnuel ?? "?"}€/an depuis ${d.lissageDebut ?? "?"}${d.lissageDuree ? ` sur ${d.lissageDuree} ans` : ""}. Ce mécanisme opaque augmente artificiellement la cotisation — à vérifier si la période est encore en cours et si la durée est correctement appliquée.` });
-      }
-
-      if (ecartMontant != null) {
-        const flag = Math.abs(ecartMontant) > 5;
-        if (flag) score += 35;
-        checks.push({ id: "montant", status: flag ? "flag" : "ok",
-          label: "Cohérence montant total",
-          detail: flag
-            ? `Affiché ${eur(d.montantTotal)} ≠ recalculé ${eur(totalRecalc)}. Écart : ${eur(ecartMontant)}.`
-            : `Montant affiché (${eur(d.montantTotal)}) cohérent avec le recalcul (${eur(totalRecalc)}).` });
-      }
-
-      if (evo != null) {
-        const flag = Math.abs(ecartEvo) > 0.03;
-        if (flag) score += 25;
-        checks.push({ id: "evolution", status: flag ? "flag" : "ok",
-          label: "Évolution cotisation N-1 → N",
-          detail: flag
-            ? `Hausse de ${pct(evo)} vs revalorisation officielle ${d.annee} (${pct(revaloOff)}). Écart de ${pct(ecartEvo)}.`
-            : `Hausse de ${pct(evo)} cohérente avec la revalorisation officielle ${d.annee} (${pct(revaloOff)}).` });
-      }
-
-      checks.push({ id: "taux", status: "info",
-        label: "Taux communal — vérification manuelle",
-        detail: `${pct(d.tauxCommune)} affiché pour ${d.commune || "?"} en ${d.annee}. À comparer au taux officiel voté (disponible sur impots.gouv.fr ou auprès de la mairie).` });
-
-      score = Math.min(100, score);
-      setResult({ d, checks, score, totalRecalc, ecartMontant, evo, revaloOff });
-
-      if (score > 0) {
-        addLog("Génération du courrier…");
-        const anomalies = checks.filter(c => c.status === "flag").map(c => c.label).join(", ");
-        const ltr = generateLetter(d, anomalies);
-        setLetter(ltr);
-      }
-
-      setPhase("done");
+      setExtracted(d);
+      setPhase("bien");
     } catch (e) {
       setErrorMsg(e?.message || String(e));
       setPhase("error");
     }
   }
 
+  // Étape 2 : formulaire court (5 champs) → étape 3 : score anomalie
+  function submitBien(e) {
+    e?.preventDefault();
+    const d = extracted;
+    if (!d) return;
+
+    addLog("Vérifications arithmétiques…");
+    const baseC = d.baseCommune || 0;
+    const baseI = d.baseIntercommunalite || baseC;
+    const cotisC = d.tauxCommune ? Math.round(baseC * d.tauxCommune) : null;
+    const cotisReste = Math.round(baseI * ((d.tauxEPCI||0)+(d.tauxOM||0)+(d.tauxSyndicats||0)+(d.tauxGEMAPI||0)));
+    const totalRecalc = cotisC != null ? cotisC + cotisReste + (d.fraisGestion||0) : null;
+    const ecartMontant = totalRecalc != null && d.montantTotal ? d.montantTotal - totalRecalc : null;
+    const revaloOff = d.annee === 2025 ? 0.039 : 0.008;
+    const c24 = d.cotisationCommune2024, c25 = d.cotisationLisseeCommune2025;
+    const evo = c24 && c25 ? (c25 - c24) / c24 : null;
+    const ecartEvo = evo != null ? evo - revaloOff : null;
+
+    const checks = [];
+    let score = 0;
+
+    if (d.lissage) {
+      score += 30;
+      checks.push({ id: "lissage", status: "flag", label: "Lissage actif détecté",
+        detail: `+${d.lissageMontantAnnuel ?? "?"}€/an depuis ${d.lissageDebut ?? "?"}${d.lissageDuree ? ` sur ${d.lissageDuree} ans` : ""}. Ce mécanisme opaque augmente artificiellement la cotisation — à vérifier si la période est encore en cours et si la durée est correctement appliquée.` });
+    }
+
+    if (ecartMontant != null) {
+      const flag = Math.abs(ecartMontant) > 5;
+      if (flag) score += 35;
+      checks.push({ id: "montant", status: flag ? "flag" : "ok",
+        label: "Cohérence montant total",
+        detail: flag
+          ? `Affiché ${eur(d.montantTotal)} ≠ recalculé ${eur(totalRecalc)}. Écart : ${eur(ecartMontant)}.`
+          : `Montant affiché (${eur(d.montantTotal)}) cohérent avec le recalcul (${eur(totalRecalc)}).` });
+    }
+
+    if (evo != null) {
+      const flag = Math.abs(ecartEvo) > 0.03;
+      if (flag) score += 25;
+      checks.push({ id: "evolution", status: flag ? "flag" : "ok",
+        label: "Évolution cotisation N-1 → N",
+        detail: flag
+          ? `Hausse de ${pct(evo)} vs revalorisation officielle ${d.annee} (${pct(revaloOff)}). Écart de ${pct(ecartEvo)}.`
+          : `Hausse de ${pct(evo)} cohérente avec la revalorisation officielle ${d.annee} (${pct(revaloOff)}).` });
+    }
+
+    // État déclaratif du bien (formulaire court) — signal supplémentaire, pas encore vérifiable
+    // automatiquement, mais on l'expose comme point de contrôle qualitatif.
+    if (bien.etat === "Vétuste / à rénover" || (bien.anneeConstruction && parseInt(bien.anneeConstruction) < 1975)) {
+      score += 10;
+      checks.push({ id: "vetuste", status: "flag", label: "Bien ancien / état dégradé déclaré",
+        detail: `Un bien ${bien.anneeConstruction ? `construit en ${bien.anneeConstruction} ` : ""}en "${bien.etat || "état non précisé"}" bénéficie parfois d'un abattement pour vétusté non appliqué. À vérifier sur la fiche d'évaluation 6660.` });
+    }
+
+    checks.push({ id: "taux", status: "info",
+      label: "Taux communal — vérification manuelle",
+      detail: `${pct(d.tauxCommune)} affiché pour ${d.commune || "?"} en ${d.annee}. À comparer au taux officiel voté (disponible sur impots.gouv.fr ou auprès de la mairie).` });
+
+    score = Math.min(100, score);
+    const trisAnnuel = ecartMontant != null && ecartMontant > 5 ? ecartMontant : 0;
+    const troPerçu3Ans = Math.round(trisAnnuel * 3);
+
+    setResult({ d, bien, checks, score, totalRecalc, ecartMontant, evo, revaloOff, troPerçu3Ans });
+
+    if (score > 0) {
+      const anomalies = checks.filter(c => c.status === "flag").map(c => c.label).join(", ");
+      const ltr = generateLetter(d, anomalies);
+      setLetter(ltr);
+    }
+
+    setPhase("done");
+  }
+
+  function submitLead(e) {
+    e?.preventDefault();
+    if (!leadEmail) return;
+    // Pas d'API pour l'instant : capture front uniquement (à brancher sur Brevo/CRM).
+    setLeadSent(true);
+  }
+
   function reset() {
     setPhase("upload"); setFileName(null); setFileData(null);
-    setLog([]); setResult(null); setLetter(null); setErrorMsg(null);
+    setLog([]); setExtracted(null); setBien(EMPTY_BIEN);
+    setResult(null); setLetter(null); setErrorMsg(null);
+    setLeadEmail(""); setLeadSent(false);
   }
 
   function downloadLetter() {
@@ -364,7 +472,7 @@ export default function TFAudit() {
       <div className="bg-white border-b border-gray-200 px-5 py-4 flex items-center justify-between sticky top-0 z-10">
         <div>
           <div className="font-bold text-gray-900">Audit Taxe Foncière</div>
-          <div className="text-xs text-gray-400">Explain Legal · TFPB v0.3</div>
+          <div className="text-xs text-gray-400">Explain Legal · TFPB v0.4</div>
         </div>
         {phase !== "upload" && (
           <button onClick={reset} className="text-xs text-blue-600 underline">Recommencer</button>
@@ -408,6 +516,67 @@ export default function TFAudit() {
           </div>
         )}
 
+        {phase === "bien" && extracted && (
+          <form onSubmit={submitBien} className="bg-white rounded-xl border border-gray-200 p-6 space-y-4">
+            <div>
+              <h1 className="text-lg font-bold text-gray-900">Votre bien</h1>
+              <p className="text-sm text-gray-500 mt-1 leading-relaxed">5 infos rapides pour affiner le score. Bien détecté à {extracted.commune || "l'adresse indiquée sur l'avis"}.</p>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold uppercase tracking-wide text-gray-400 mb-1.5">Superficie (m²)</label>
+              <input type="number" min="1" required value={bien.superficie}
+                onChange={e => setBien(b => ({ ...b, superficie: e.target.value }))}
+                className="w-full border border-gray-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-blue-400" placeholder="ex : 85" />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold uppercase tracking-wide text-gray-400 mb-1.5">Type de bien</label>
+              <div className="grid grid-cols-2 gap-2">
+                {TYPES_BIEN.map(opt => (
+                  <button type="button" key={opt} onClick={() => setBien(b => ({ ...b, type: opt }))}
+                    className={`text-sm py-2.5 rounded-lg border transition-colors ${bien.type === opt ? "bg-gray-900 text-white border-gray-900" : "border-gray-200 text-gray-700 hover:border-gray-400"}`}>
+                    {opt}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold uppercase tracking-wide text-gray-400 mb-1.5">État général</label>
+              <div className="grid grid-cols-1 gap-2">
+                {ETATS_BIEN.map(opt => (
+                  <button type="button" key={opt} onClick={() => setBien(b => ({ ...b, etat: opt }))}
+                    className={`text-sm py-2.5 rounded-lg border text-left px-3 transition-colors ${bien.etat === opt ? "bg-gray-900 text-white border-gray-900" : "border-gray-200 text-gray-700 hover:border-gray-400"}`}>
+                    {opt}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wide text-gray-400 mb-1.5">DPE</label>
+                <select value={bien.dpe} onChange={e => setBien(b => ({ ...b, dpe: e.target.value }))}
+                  className="w-full border border-gray-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-blue-400">
+                  <option value="">—</option>
+                  {["A","B","C","D","E","F","G"].map(l => <option key={l} value={l}>{l}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wide text-gray-400 mb-1.5">Année construction</label>
+                <input type="number" min="1800" max="2026" value={bien.anneeConstruction}
+                  onChange={e => setBien(b => ({ ...b, anneeConstruction: e.target.value }))}
+                  className="w-full border border-gray-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-blue-400" placeholder="ex : 1998" />
+              </div>
+            </div>
+
+            <button type="submit" className="w-full bg-gray-900 text-white py-3 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 hover:bg-gray-700 transition-colors">
+              Voir mon score d'anomalie <ChevronRight size={16} />
+            </button>
+          </form>
+        )}
+
         {phase === "error" && (
           <div className="bg-white rounded-xl border border-red-200 p-6 space-y-3">
             <div className="flex items-center gap-2">
@@ -447,6 +616,14 @@ export default function TFAudit() {
               {result.checks.map(c => <Check key={c.id} {...c} />)}
             </div>
 
+            {result.troPerçu3Ans > 0 && (
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
+                <p className="text-xs font-semibold uppercase tracking-wide text-amber-600 mb-1">Trop-perçu estimé sur 3 ans</p>
+                <p className="text-2xl font-bold text-amber-700">{eur(result.troPerçu3Ans)}</p>
+                <p className="text-xs text-amber-600 mt-1 leading-relaxed">Basé sur l'écart annuel constaté ({eur(result.ecartMontant)}) projeté sur 3 ans — c'est le délai de réclamation possible auprès de l'administration.</p>
+              </div>
+            )}
+
             {letter && (
               <div className="bg-white rounded-xl border border-gray-200 p-4">
                 <div className="flex items-center justify-between mb-3">
@@ -467,6 +644,30 @@ export default function TFAudit() {
                   <p className="text-sm font-medium text-green-700">Aucune anomalie détectée</p>
                 </div>
                 <p className="text-xs text-green-600 mt-1 leading-relaxed">Cela ne garantit pas que la valeur locative soit correcte — seule la fiche d'évaluation 6660 le confirme.</p>
+              </div>
+            )}
+
+            {result.score > 0 && (
+              <div className="bg-gray-900 rounded-xl p-5 text-white">
+                {!leadSent ? (
+                  <form onSubmit={submitLead} className="space-y-3">
+                    <p className="text-sm font-bold">On s'occupe de tout, vous ne payez qu'en cas de succès</p>
+                    <p className="text-xs text-gray-300 leading-relaxed">49€ de frais de dossier + 30% du remboursement obtenu. Notre expert-comptable partenaire monte le dossier, dépose la demande auprès du CDIF et suit le dégrèvement jusqu'au bout.</p>
+                    <div className="flex gap-2">
+                      <input type="email" required value={leadEmail} onChange={e => setLeadEmail(e.target.value)}
+                        placeholder="votre@email.fr"
+                        className="flex-1 bg-white/10 border border-white/20 rounded-lg px-3 py-2.5 text-sm placeholder-gray-400 focus:outline-none focus:border-white/50" />
+                      <button type="submit" className="bg-white text-gray-900 px-4 py-2.5 rounded-lg text-sm font-semibold hover:bg-gray-100 whitespace-nowrap">
+                        Être recontacté
+                      </button>
+                    </div>
+                  </form>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <CheckCircle2 size={18} className="text-green-400" />
+                    <p className="text-sm">Merci ! On revient vers vous sous 48h.</p>
+                  </div>
+                )}
               </div>
             )}
           </>
