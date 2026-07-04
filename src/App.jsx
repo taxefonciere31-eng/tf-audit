@@ -66,7 +66,7 @@ const PCT_RE = /(\d{1,3}[,\.]\d{1,3})\s*%/;
 // one giant number instead of stopping at the first value. These amounts
 // are small enough (a few thousand euros max) that a plain contiguous digit
 // run is safer than trying to guess where a real separator ends.
-const NUM_RE = /(\d+(?:[,\.]\d{1,2})?)\s*€?/;
+const NUM_RE = /(\d+(?:[,\.]\d{1,2})?)\s*[€¤]?/;
 // Grabs every distinct number on a line — used for multi-column rows like "Base".
 const ALL_NUMS_RE = /\d+(?:[,\.]\d{1,2})?/g;
 
@@ -92,59 +92,125 @@ function extractData(text) {
   const proprioMatch = t.match(/SCI\s+[\w\s]+|SARL\s+[\w\s]+|SAS\s+[\w\s]+|EURL\s+[\w\s]+|M[MR]\.\s+[\w\s]+/i);
   const entreprise = proprioMatch ? proprioMatch[0].trim().slice(0, 40) : null;
 
-  // Commune
-  const communeMatch = t.match(/commune\s+d.imposition\s*:?\s*(\d+)?\s*([A-Z][A-Z\-\s]+)/i)
-    || t.match(/Taxes fonci.res.*?commune\s+de\s+([A-Z][A-Z\-\s]+)/i);
-  const commune = communeMatch ? communeMatch[communeMatch.length - 1].trim().slice(0, 30) : null;
+  // Commune — no reliable "Commune : X" label exists on this document type
+  // (avis d'échéances). The commune name instead appears as a standalone
+  // all-caps line right before "Montant de vos/votre taxe(s) foncière(s)".
+  const montantLineIdx = lines.findIndex(l => /Montant\s+de\s+(vos|votre)\s+tax(es?)?\s+fonci.re/i.test(l) || /Montant\s+de\s+votre\s+imp.t/i.test(l));
+  let commune = null;
+  if (montantLineIdx > 0) {
+    for (let i = montantLineIdx - 1; i >= Math.max(0, montantLineIdx - 3); i--) {
+      const candidate = lines[i].trim();
+      if (/^[A-ZÀ-Ÿ][A-ZÀ-Ÿ\-\s]{2,30}$/.test(candidate)) { commune = candidate; break; }
+    }
+  }
+  if (!commune) {
+    const communeMatch = t.match(/commune\s+d.imposition\s*:?\s*(\d+)?\s*([A-Z][A-Z\-\s]+)/i);
+    commune = communeMatch ? communeMatch[communeMatch.length - 1].trim().slice(0, 30) : null;
+  }
 
-  // Département
-  const deptMatch = t.match(/[Dd].partement\s+d.imposition\s*:?\s*(\d{2,3})/);
+  // Département — derive from any 5-digit postal code in the document (first
+  // 2 digits), since there's no explicit "Département : XX" label here.
+  const deptMatch = t.match(/[Dd].partement\s+d.imposition\s*:?\s*(\d{2,3})/) || t.match(/\b(\d{2})\d{3}\b(?=\s+[A-ZÀ-Ÿ])/);
   const departement = deptMatch ? deptMatch[1] : null;
 
   // Adresse du bien (240 CHE DE MARRET style)
   const adresseMatch = t.match(/(\d{1,4}\s+(?:CHE|RUE|AV|BD|IMP|ALL|PL)\s+[\w\s]+?)(?=\s{2,}|\n)/i);
   const adresse = adresseMatch ? adresseMatch[1].trim().slice(0, 60) : null;
 
-  // Année
-  const anneeMatch = t.match(/Taxes fonci.res\s+(\d{4})/i) || t.match(/pour\s+(\d{4})/i);
-  const annee = anneeMatch ? parseInt(anneeMatch[1]) : 2025;
+  // Année — "Montant de vos taxes foncières 3685,00 ¤" was wrongly matched as
+  // a year before (3685 IS 4 digits!). Anchor instead on the specific sentence
+  // that introduces the rate table: "...sont les suivantes pour 2025 :".
+  const anneeMatch = t.match(/suivantes\s+pour\s+(\d{4})\s*:/i) || t.match(/exercice\s+(\d{4})/i);
+  const anneeCandidate = anneeMatch ? parseInt(anneeMatch[1]) : null;
+  const annee = (anneeCandidate && anneeCandidate > 2015 && anneeCandidate < 2035) ? anneeCandidate : 2025;
 
-  // ---- Taux, per collectivité — label-anchored first, positional as fallback ----
-  const tauxCommuneStr = findValue(lines, [/taux\s+commun/i], PCT_RE);
-  const tauxSyndicatsStr = findValue(lines, [/taux\s+syndicat/i], PCT_RE);
-  const tauxEPCIStr = findValue(lines, [/taux\s+interco/i, /taux\s+intercommunal/i, /\bEPCI\b/i], PCT_RE);
-  const tauxOMStr = findValue(lines, [/taux\s+OM\b/i, /ordures\s+m[ée]nag/i], PCT_RE);
-  const tauxGEMAPIStr = findValue(lines, [/GEMAPI/i], PCT_RE);
+  // ---- Taux, per collectivité ----
+  // The real table has no per-row labels — just two lines of 6 numbers each
+  // (previous year, then current year). Rather than trust column *position*
+  // (which can vary between documents), we classify by two more reliable
+  // signals: (1) a narrative sentence sometimes states a specific collectivité's
+  // rate change directly ("le taux relatif au syndicat... passe de 5,39 % à
+  // 4,91 %") — an exact, unambiguous anchor when present; (2) failing that,
+  // rate *magnitude* is a decent proxy since these categories have
+  // structurally different typical ranges (commune is always the largest;
+  // GEMAPI is always tiny, under ~1%).
+  const pctRowRe = /^(\d{1,3}[,\.]\d{1,3})\s+(\d{1,3}[,\.]\d{1,3})\s+(\d{1,3}[,\.]\d{1,3})\s+(\d{1,3}[,\.]\d{1,3})\s+(\d{1,3}[,\.]\d{1,3})\s+(\d{1,3}[,\.]\d{1,3})$/;
+  let tauxRows = [];
+  let tauxRowIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(pctRowRe);
+    if (m) { tauxRows.push(m.slice(1, 7).map(parseNum)); if (tauxRowIdx === -1) tauxRowIdx = i; }
+  }
 
-  let tauxCommune = tauxCommuneStr ? parseNum(tauxCommuneStr) / 100 : null;
-  let tauxSyndicats = tauxSyndicatsStr ? parseNum(tauxSyndicatsStr) / 100 : null;
-  let tauxEPCI = tauxEPCIStr ? parseNum(tauxEPCIStr) / 100 : null;
-  let tauxOM = tauxOMStr ? parseNum(tauxOMStr) / 100 : null;
-  let tauxGEMAPI = tauxGEMAPIStr ? parseNum(tauxGEMAPIStr) / 100 : null;
+  let tauxCommune = null, tauxSyndicats = null, tauxEPCI = null, tauxOM = null, tauxGEMAPI = null;
+  let colOrder = null; // remembers which column index maps to which collectivité, reused for the base row
 
-  // Fallback: no labels found (raw/unlabelled layout) — use positional order
-  // of every "%" occurrence in the doc, best-effort only.
-  if (tauxCommune == null && tauxEPCI == null && tauxOM == null) {
-    const tauxAll = [...t.matchAll(/(\d{1,3}[,\.]\d{1,3})\s*%/g)].map(m => parseNum(m[1]) / 100);
-    tauxCommune = tauxAll[0] ?? null;
-    tauxEPCI = tauxAll[2] ?? tauxAll[1] ?? null;
-    tauxOM = tauxAll[4] ?? null;
-    tauxSyndicats = tauxAll[6] ?? null;
-    tauxGEMAPI = tauxAll[8] ?? null;
+  if (tauxRows.length >= 1) {
+    const current = tauxRows[tauxRows.length - 1]; // most recent year = last matching row
+    const remaining = current.map((v, i) => ({ v, i }));
+
+    // (1) Narrative anchor for syndicat, if present.
+    const syndMatch = t.match(/syndicat[^%]*?(\d{1,3}[,\.]\d{1,3})\s*%?\s*(?:à|a)\s*(\d{1,3}[,\.]\d{1,3})\s*%/i);
+    let syndIdx = -1;
+    if (syndMatch) {
+      const targetVal = parseNum(syndMatch[2]);
+      const found = remaining.find(x => Math.abs(x.v - targetVal) < 0.01);
+      if (found) syndIdx = found.i;
+    }
+
+    // (2) Magnitude fallback for the rest. Once commune (largest) and
+    // syndicat (narrative-confirmed) are set aside, the remaining categories
+    // sort fairly reliably by typical magnitude: ordures ménagères (OM) is
+    // usually the biggest of what's left, then intercommunalité (EPCI), then
+    // GEMAPI — which, on real documents, is NOT always the single smallest
+    // value: some avis carry a 6th, even-smaller line (e.g. taxe spéciale
+    // d'équipement) that GEMAPI itself sits above. So GEMAPI = 3rd of the
+    // remaining pool by magnitude, not "whatever's left over".
+    const sorted = [...remaining].sort((a, b) => b.v - a.v);
+    const communeIdx = sorted[0]?.i;
+    const pool = sorted.filter(x => x.i !== communeIdx && x.i !== syndIdx);
+    const omIdx = pool[0]?.i;
+    const epciIdx = pool[1]?.i;
+    const gemapiIdx = pool[2]?.i;
+
+    colOrder = { communeIdx, syndIdx, epciIdx, omIdx, gemapiIdx };
+    tauxCommune = communeIdx != null ? current[communeIdx] / 100 : null;
+    tauxSyndicats = syndIdx != null && syndIdx !== -1 ? current[syndIdx] / 100 : null;
+    tauxEPCI = epciIdx != null ? current[epciIdx] / 100 : null;
+    tauxOM = omIdx != null ? current[omIdx] / 100 : null;
+    tauxGEMAPI = gemapiIdx != null ? current[gemapiIdx] / 100 : null;
+  } else {
+    // Fallback for documents with a totally different layout: label-anchored search.
+    const tauxCommuneStr = findValue(lines, [/taux\s+commun/i], PCT_RE);
+    const tauxSyndicatsStr = findValue(lines, [/taux\s+syndicat/i], PCT_RE);
+    const tauxEPCIStr = findValue(lines, [/taux\s+interco/i, /taux\s+intercommunal/i, /\bEPCI\b/i], PCT_RE);
+    const tauxOMStr = findValue(lines, [/taux\s+OM\b/i, /ordures\s+m[ée]nag/i], PCT_RE);
+    const tauxGEMAPIStr = findValue(lines, [/GEMAPI/i], PCT_RE);
+    tauxCommune = tauxCommuneStr ? parseNum(tauxCommuneStr) / 100 : null;
+    tauxSyndicats = tauxSyndicatsStr ? parseNum(tauxSyndicatsStr) / 100 : null;
+    tauxEPCI = tauxEPCIStr ? parseNum(tauxEPCIStr) / 100 : null;
+    tauxOM = tauxOMStr ? parseNum(tauxOMStr) / 100 : null;
+    tauxGEMAPI = tauxGEMAPIStr ? parseNum(tauxGEMAPIStr) / 100 : null;
   }
 
   // ---- Base d'imposition ----
-  // A "Base" row can hold up to 5 columns (Commune / EPCI / OM / Syndicat /
-  // GEMAPI) on the same line. Grab every number on that line, not just the
-  // first, and map them positionally instead of assuming one shared value.
+  // The base row sits right after the taux rows and shares the same 6
+  // columns — reuse colOrder from the taux classification instead of
+  // guessing again. When every column holds the same value (common: the
+  // base is often identical across collectivités), that single value is
+  // applied to all fields either way.
   let baseCommune = null, baseEPCI = null, baseOM = null, baseSyndicats = null, baseGEMAPI = null;
-  const baseLineIdx = lines.findIndex(l => /^base\b/i.test(l) || /base\s+d.imposition/i.test(l));
+  const baseSearchStart = tauxRowIdx !== -1 ? tauxRowIdx : 0;
+  const baseLineIdx = lines.findIndex((l, i) => i >= baseSearchStart && /^\d+(\s+\d+){4,5}$/.test(l.trim()));
   if (baseLineIdx !== -1) {
     const baseNums = (lines[baseLineIdx].match(ALL_NUMS_RE) || []).map(parseNum);
-    if (baseNums.length >= 5) {
-      [baseCommune, baseEPCI, baseOM, baseSyndicats, baseGEMAPI] = baseNums;
+    if (baseNums.length >= 5 && colOrder) {
+      baseCommune = baseNums[colOrder.communeIdx];
+      baseEPCI = colOrder.epciIdx != null ? baseNums[colOrder.epciIdx] : null;
+      baseOM = colOrder.omIdx != null ? baseNums[colOrder.omIdx] : null;
+      baseSyndicats = colOrder.syndIdx != null && colOrder.syndIdx !== -1 ? baseNums[colOrder.syndIdx] : null;
+      baseGEMAPI = colOrder.gemapiIdx != null ? baseNums[colOrder.gemapiIdx] : null;
     } else if (baseNums.length >= 1) {
-      // Single shared base for the whole property — apply to every collectivité.
       baseCommune = baseEPCI = baseOM = baseSyndicats = baseGEMAPI = baseNums[0];
     }
   } else {
@@ -154,7 +220,12 @@ function extractData(text) {
   baseCommune = baseCommune != null ? Math.round(baseCommune) : null;
   const baseIntercommunalite = baseEPCI != null ? Math.round(baseEPCI) : baseCommune;
 
-  // ---- Cotisations N-1 / N (e.g. "Cotisation 2024 : 3510€ / Cotisation 2025 : 3510€") ----
+  // ---- Cotisations N-1 / N ----
+  // Some avis spell this out explicitly ("Cotisation 2024 : X€ / Cotisation
+  // 2025 : Y€") — when that phrasing isn't present (as on an avis
+  // d'échéances), we simply can't derive a reliable N-1 total from a bare
+  // numeric grid without risking another wrong guess, so this stays null
+  // and the "évolution N-1 → N" check is skipped rather than shown wrong.
   const cotisPairMatch = t.match(/Cotisation\s*(\d{4})[^\d€]*(\d+(?:[,\.]\d{1,2})?)\s*€.{0,30}?Cotisation\s*(\d{4})[^\d€]*(\d+(?:[,\.]\d{1,2})?)\s*€/i);
   let cotisationCommune2024 = null, cotisationLisseeCommune2025 = null;
   if (cotisPairMatch) {
@@ -168,8 +239,8 @@ function extractData(text) {
   }
 
   // ---- Montant total ----
-  const montantStr = findValue(lines, [/Montant\s+de\s+votre\s+imp.t/i, /Montant\s+total/i], NUM_RE)
-    || (t.match(/Somme\s+.+?(\d+(?:[,\.]\d{1,2})?)\s*€/i) || [])[1];
+  const montantStr = findValue(lines, [/Montant\s+de\s+(vos|votre)\s+tax(es?)?\s+fonci.re/i, /Montant\s+de\s+votre\s+imp.t/i, /Montant\s+total/i], NUM_RE)
+    || (t.match(/Somme\s+.+?(\d+(?:[,\.]\d{1,2})?)\s*[€¤]/i) || [])[1];
   const montantTotal = montantStr ? parseNum(montantStr) : null;
 
   // ---- Frais de gestion ----
@@ -340,7 +411,6 @@ export default function TFAudit() {
       if (fileData?.isPdf) {
         addLog("Extraction du texte PDF…");
         text = await extractPdfText(fileData.base64);
-        console.log('RAW PDF TEXT:', text);
         addLog(`${text.length} caractères extraits`);
       } else {
         addLog("Mode démonstration (SCI Place de la Croix)");
