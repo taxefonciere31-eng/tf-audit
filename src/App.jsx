@@ -142,7 +142,7 @@ function extractData(text) {
     if (m) { tauxRows.push(m.slice(1, 7).map(parseNum)); if (tauxRowIdx === -1) tauxRowIdx = i; }
   }
 
-  let tauxCommune = null, tauxSyndicats = null, tauxEPCI = null, tauxOM = null, tauxGEMAPI = null;
+  let tauxCommune = null, tauxSyndicats = null, tauxEPCI = null, tauxOM = null, tauxGEMAPI = null, tauxAutre = null;
   let colOrder = null; // remembers which column index maps to which collectivité, reused for the base row
 
   if (tauxRows.length >= 1) {
@@ -172,13 +172,15 @@ function extractData(text) {
     const omIdx = pool[0]?.i;
     const epciIdx = pool[1]?.i;
     const gemapiIdx = pool[2]?.i;
+    const autreIdx = pool[3]?.i; // 6th column (e.g. taxe spéciale d'équipement) — small, unlabeled, but real
 
-    colOrder = { communeIdx, syndIdx, epciIdx, omIdx, gemapiIdx };
+    colOrder = { communeIdx, syndIdx, epciIdx, omIdx, gemapiIdx, autreIdx };
     tauxCommune = communeIdx != null ? current[communeIdx] / 100 : null;
     tauxSyndicats = syndIdx != null && syndIdx !== -1 ? current[syndIdx] / 100 : null;
     tauxEPCI = epciIdx != null ? current[epciIdx] / 100 : null;
     tauxOM = omIdx != null ? current[omIdx] / 100 : null;
     tauxGEMAPI = gemapiIdx != null ? current[gemapiIdx] / 100 : null;
+    tauxAutre = autreIdx != null ? current[autreIdx] / 100 : null;
   } else {
     // Fallback for documents with a totally different layout: label-anchored search.
     const tauxCommuneStr = findValue(lines, [/taux\s+commun/i], PCT_RE);
@@ -199,7 +201,7 @@ function extractData(text) {
   // guessing again. When every column holds the same value (common: the
   // base is often identical across collectivités), that single value is
   // applied to all fields either way.
-  let baseCommune = null, baseEPCI = null, baseOM = null, baseSyndicats = null, baseGEMAPI = null;
+  let baseCommune = null, baseEPCI = null, baseOM = null, baseSyndicats = null, baseGEMAPI = null, baseAutre = null;
   const baseSearchStart = tauxRowIdx !== -1 ? tauxRowIdx : 0;
   const baseLineIdx = lines.findIndex((l, i) => i >= baseSearchStart && /^\d+(\s+\d+){4,5}$/.test(l.trim()));
   if (baseLineIdx !== -1) {
@@ -210,15 +212,38 @@ function extractData(text) {
       baseOM = colOrder.omIdx != null ? baseNums[colOrder.omIdx] : null;
       baseSyndicats = colOrder.syndIdx != null && colOrder.syndIdx !== -1 ? baseNums[colOrder.syndIdx] : null;
       baseGEMAPI = colOrder.gemapiIdx != null ? baseNums[colOrder.gemapiIdx] : null;
+      baseAutre = colOrder.autreIdx != null ? baseNums[colOrder.autreIdx] : null;
     } else if (baseNums.length >= 1) {
-      baseCommune = baseEPCI = baseOM = baseSyndicats = baseGEMAPI = baseNums[0];
+      baseCommune = baseEPCI = baseOM = baseSyndicats = baseGEMAPI = baseAutre = baseNums[0];
     }
   } else {
     const baseFallback = (t.match(/Base\s*:?\s*(\d+(?:[,\.]\d{1,2})?)\s*€/i) || [])[1];
-    if (baseFallback) baseCommune = baseEPCI = baseOM = baseSyndicats = baseGEMAPI = parseNum(baseFallback);
+    if (baseFallback) baseCommune = baseEPCI = baseOM = baseSyndicats = baseGEMAPI = baseAutre = parseNum(baseFallback);
   }
   baseCommune = baseCommune != null ? Math.round(baseCommune) : null;
   const baseIntercommunalite = baseEPCI != null ? Math.round(baseEPCI) : baseCommune;
+
+  // ---- Frais de gestion : formule légale fixe (CGI, art. 1641), pas une
+  // donnée à extraire du texte. L'État prélève 3 % de la cotisation de
+  // chaque collectivité, SAUF le syndicat de communes et la TEOM/OM qui
+  // sont taxés à 8 % (frais d'assiette + de dégrèvement, taux "établissements
+  // publics divers"). On calcule donc chaque cotisation (base × taux) puis on
+  // applique le bon pourcentage — ça ne dépend d'aucune donnée externe et ça
+  // ne peut pas devenir obsolète (le taux légal ne change pas d'une année à
+  // l'autre, contrairement aux taux votés par les collectivités).
+  const cotis = (base, taux) => (base != null && taux != null) ? base * taux : null;
+  const cotisCommuneCalc = cotis(baseCommune, tauxCommune);
+  const cotisEPCICalc = cotis(baseEPCI ?? baseCommune, tauxEPCI);
+  const cotisOMCalc = cotis(baseOM ?? baseCommune, tauxOM);
+  const cotisSyndicatCalc = cotis(baseSyndicats ?? baseCommune, tauxSyndicats);
+  const cotisGEMAPICalc = cotis(baseGEMAPI ?? baseCommune, tauxGEMAPI);
+  const cotisAutreCalc = cotis(baseAutre ?? baseCommune, tauxAutre);
+
+  const tauxReduit = [cotisCommuneCalc, cotisEPCICalc, cotisGEMAPICalc, cotisAutreCalc].filter(v => v != null);
+  const tauxEleve = [cotisOMCalc, cotisSyndicatCalc].filter(v => v != null);
+  const fraisGestionCalc = (tauxReduit.length || tauxEleve.length)
+    ? Math.round(tauxReduit.reduce((a, b) => a + b, 0) * 0.03 + tauxEleve.reduce((a, b) => a + b, 0) * 0.08)
+    : null;
 
   // ---- Cotisations N-1 / N ----
   // Some avis spell this out explicitly ("Cotisation 2024 : X€ / Cotisation
@@ -244,8 +269,12 @@ function extractData(text) {
   const montantTotal = montantStr ? parseNum(montantStr) : null;
 
   // ---- Frais de gestion ----
+  // Prefer the computed value (exact, formula-based, works even when the
+  // document never spells out "Frais de gestion" as its own line — as with
+  // the avis d'échéances). Only fall back to a labeled-text search if we
+  // couldn't compute it (missing base or taux for every category).
   const fraisStr = findValue(lines, [/Frais\s+de\s+gestion/i], NUM_RE);
-  const fraisGestion = fraisStr ? Math.round(parseNum(fraisStr)) : null;
+  const fraisGestion = fraisGestionCalc != null ? fraisGestionCalc : (fraisStr ? Math.round(parseNum(fraisStr)) : null);
 
   // ---- Lissage ----
   const lissageMatch = t.match(/lissage\s+de\s+\+?\s*(\d+)\s*€?\s*par\s+an/i)
@@ -257,12 +286,22 @@ function extractData(text) {
   const lissageDureeMatch = t.match(/(\d+)\s+ans/i);
   const lissageDuree = lissageDureeMatch ? parseInt(lissageDureeMatch[1]) : null;
 
+  // ---- Total recalculé, exact ----
+  // Round each category's cotisation individually (DGFiP rounds per line
+  // before summing, which is why a naive "round the grand total" approach
+  // drifts by a few euros), then add the legally-fixed frais de gestion.
+  const cotisationsRounded = [cotisCommuneCalc, cotisEPCICalc, cotisOMCalc, cotisSyndicatCalc, cotisGEMAPICalc, cotisAutreCalc]
+    .filter(v => v != null).map(v => Math.round(v));
+  const sousTotalCotisations = cotisationsRounded.length ? cotisationsRounded.reduce((a, b) => a + b, 0) : null;
+  const montantRecalcule = (sousTotalCotisations != null && fraisGestion != null) ? sousTotalCotisations + fraisGestion : null;
+
   return {
     entreprise, adresse, commune, departement, annee,
     baseCommune, baseIntercommunalite,
-    tauxCommune, tauxEPCI, tauxOM, tauxSyndicats, tauxGEMAPI,
+    tauxCommune, tauxEPCI, tauxOM, tauxSyndicats, tauxGEMAPI, tauxAutre,
     cotisationCommune2024, cotisationLisseeCommune2025,
     montantTotal, fraisGestion,
+    sousTotalCotisations, montantRecalcule,
     lissage, lissageMontantAnnuel, lissageDebut, lissageDuree
   };
 }
@@ -428,6 +467,7 @@ export default function TFAudit() {
           tauxSyndicats: 0.0061, tauxGEMAPI: 0.00314,
           cotisationCommune2024: 454, cotisationLisseeCommune2025: 464,
           montantTotal: 662, fraisGestion: 25,
+          sousTotalCotisations: 648, montantRecalcule: 673,
           lissage: true, lissageMontantAnnuel: 10, lissageDebut: 2017, lissageDuree: 10
         };
       } else {
@@ -449,11 +489,7 @@ export default function TFAudit() {
     if (!d) return;
 
     addLog("Vérifications arithmétiques…");
-    const baseC = d.baseCommune || 0;
-    const baseI = d.baseIntercommunalite || baseC;
-    const cotisC = d.tauxCommune ? Math.round(baseC * d.tauxCommune) : null;
-    const cotisReste = Math.round(baseI * ((d.tauxEPCI||0)+(d.tauxOM||0)+(d.tauxSyndicats||0)+(d.tauxGEMAPI||0)));
-    const totalRecalc = cotisC != null ? cotisC + cotisReste + (d.fraisGestion||0) : null;
+    const totalRecalc = d.montantRecalcule;
     const ecartMontant = totalRecalc != null && d.montantTotal ? d.montantTotal - totalRecalc : null;
     const revaloOff = d.annee === 2025 ? 0.039 : 0.008;
     const c24 = d.cotisationCommune2024, c25 = d.cotisationLisseeCommune2025;
@@ -470,7 +506,7 @@ export default function TFAudit() {
     }
 
     if (ecartMontant != null) {
-      const flag = Math.abs(ecartMontant) > 5;
+      const flag = Math.abs(ecartMontant) > 15;
       if (flag) score += 35;
       checks.push({ id: "montant", status: flag ? "flag" : "ok",
         label: "Cohérence montant total",
@@ -663,6 +699,13 @@ export default function TFAudit() {
           <>
             <ScoreBadge score={result.score} />
 
+            <div className="bg-blue-50 border border-blue-100 rounded-xl p-3.5">
+              <p className="text-xs font-semibold text-blue-700 mb-1">Ce qui est vérifié à l'euro près</p>
+              <p className="text-xs text-blue-600 leading-relaxed">Le calcul base × taux + frais de gestion légaux (art. 1641 CGI) est recalculé et comparé au montant affiché sur l'avis.</p>
+              <p className="text-xs font-semibold text-blue-700 mt-2 mb-1">Ce qui reste à vérifier manuellement</p>
+              <p className="text-xs text-blue-600 leading-relaxed">Que les taux appliqués sont bien les taux votés cette année par les collectivités (impots.gouv.fr / mairie), et que la valeur locative elle-même est correcte (fiche d'évaluation 6660, sur demande au CDIF).</p>
+            </div>
+
             <div className="bg-white rounded-xl border border-gray-200 p-4">
               <p className="text-xs font-semibold uppercase tracking-wide text-gray-400 mb-3">Bien analysé</p>
               <Row label="Propriétaire" value={result.d.entreprise || "—"} />
@@ -678,8 +721,9 @@ export default function TFAudit() {
               <Row label="Taux EPCI" value={pct(result.d.tauxEPCI)} />
               <Row label="Taux ordures" value={pct(result.d.tauxOM)} />
               <Row label="Taux GEMAPI" value={pct(result.d.tauxGEMAPI)} />
-              <Row label="Montant affiché" value={eur(result.d.montantTotal)} flag={result.ecartMontant != null && Math.abs(result.ecartMontant) > 5} />
-              <Row label="Recalculé (base×taux)" value={eur(result.totalRecalc)} flag={result.ecartMontant != null && Math.abs(result.ecartMontant) > 5} />
+              <Row label="Frais de gestion (calculé, art. 1641 CGI)" value={eur(result.d.fraisGestion)} />
+              <Row label="Montant affiché" value={eur(result.d.montantTotal)} flag={result.ecartMontant != null && Math.abs(result.ecartMontant) > 15} />
+              <Row label="Recalculé (base×taux + frais gestion)" value={eur(result.totalRecalc)} flag={result.ecartMontant != null && Math.abs(result.ecartMontant) > 15} />
             </div>
 
             <div className="bg-white rounded-xl border border-gray-200 p-4">
