@@ -286,6 +286,10 @@ function extractData(text) {
   const lissageDureeMatch = t.match(/(\d+)\s+ans/i);
   const lissageDuree = lissageDureeMatch ? parseInt(lissageDureeMatch[1]) : null;
 
+  // Référence administrative (identifie précisément le local pour une demande de fiche 6660)
+  const refMatch = t.match(/R[ée]f[ée]rences?\s+administratives?\s*:?\s*([\dA-Z\s]{10,30})/i);
+  const referenceAdministrative = refMatch ? refMatch[1].trim().replace(/\s+/g, " ") : null;
+
   // ---- Total recalculé, exact ----
   // Round each category's cotisation individually (DGFiP rounds per line
   // before summing, which is why a naive "round the grand total" approach
@@ -296,7 +300,7 @@ function extractData(text) {
   const montantRecalcule = (sousTotalCotisations != null && fraisGestion != null) ? sousTotalCotisations + fraisGestion : null;
 
   return {
-    entreprise, adresse, commune, departement, annee,
+    entreprise, adresse, commune, departement, annee, referenceAdministrative,
     baseCommune, baseIntercommunalite,
     tauxCommune, tauxEPCI, tauxOM, tauxSyndicats, tauxGEMAPI, tauxAutre,
     cotisationCommune2024, cotisationLisseeCommune2025,
@@ -323,7 +327,7 @@ Fait à [Ville], le ${today}
 
 Objet : Demande de fiche d'évaluation détaillée — Taxe foncière sur les propriétés bâties ${d.annee || 2025}
 Réf. bien : ${d.adresse || "—"}, ${d.commune || "—"} (${d.departement || "—"})
-Contribuable : ${d.entreprise || "—"}
+${d.referenceAdministrative ? `Référence administrative (parcelle) : ${d.referenceAdministrative}\n` : ""}Contribuable : ${d.entreprise || "—"}
 
 Madame, Monsieur,
 
@@ -357,6 +361,41 @@ Veuillez agréer, Madame, Monsieur, l'expression de nos salutations distinguées
 
 ---
 Note : Ce courrier constitue une demande d'information (mandat léger). Il ne s'agit pas d'une réclamation formelle au sens des articles R*190-1 et R*196-2 du livre des procédures fiscales. Une réclamation éventuelle ferait l'objet d'un courrier distinct, après analyse de la fiche d'évaluation.`;
+}
+
+// ---- Mandat / procuration — pour que l'expert-comptable puisse agir au nom du client ----
+function generateMandat(d) {
+  const today = new Date().toLocaleDateString("fr-FR");
+  return `MANDAT DE REPRÉSENTATION
+Demande de fiche d'évaluation de la valeur locative — Taxe foncière sur les propriétés bâties
+
+Je soussigné(e) [NOM, PRÉNOM DU CONTRIBUABLE]${d.entreprise ? ` (${d.entreprise})` : ""}, propriétaire du bien désigné ci-dessous, donne mandat à :
+
+[NOM DU CABINET COMPTABLE / MANDATAIRE]
+[Adresse du cabinet]
+[N° SIREN / agrément le cas échéant]
+
+pour me représenter auprès du Centre des Impôts Fonciers (CDIF) et de la Direction Générale des Finances Publiques (DGFiP), aux fins de :
+
+1. Demander et recevoir en mon nom la fiche d'évaluation de la valeur locative (formulaire 6660 ou extrait GMBI) du bien désigné ci-après ;
+2. Consulter le détail du calcul de la taxe foncière (base, catégorie, surface pondérée, coefficients appliqués) ;
+3. Le cas échéant, engager en mon nom une démarche de réclamation ou de rectification auprès de l'administration fiscale, dans les conditions prévues par le livre des procédures fiscales.
+
+Désignation du bien :
+Adresse : ${d.adresse || "[ADRESSE DU BIEN]"}
+Commune : ${d.commune || "[COMMUNE]"} (${d.departement || "[DÉPARTEMENT]"})
+${d.referenceAdministrative ? `Référence administrative (parcelle) : ${d.referenceAdministrative}\n` : ""}Année d'imposition concernée : ${d.annee || 2025}
+
+Ce mandat est valable pour la durée nécessaire à l'accomplissement des démarches ci-dessus et peut être révoqué à tout moment par écrit.
+
+Fait à [Ville], le ${today}
+
+Signature du mandant (contribuable) :                    Signature du mandataire (cabinet) :
+[NOM, PRÉNOM]                                              [NOM DU CABINET]
+
+
+---
+Note : ce document est un modèle. Il doit être relu et, le cas échéant, adapté par un professionnel du droit ou de la comptabilité avant signature — notamment si le mandat doit couvrir une procédure contentieuse.`;
 }
 
 // ---- UI helpers ----
@@ -433,6 +472,7 @@ export default function TFAudit() {
   const [bien, setBien] = useState(EMPTY_BIEN);
   const [result, setResult] = useState(null);
   const [letter, setLetter] = useState(null);
+  const [mandat, setMandat] = useState(null);
   const [errorMsg, setErrorMsg] = useState(null);
   const [leadEmail, setLeadEmail] = useState("");
   const [leadSent, setLeadSent] = useState(false);
@@ -559,6 +599,7 @@ export default function TFAudit() {
       const anomalies = checks.filter(c => c.status === "flag").map(c => c.label).join(", ");
       const ltr = generateLetter(d, anomalies);
       setLetter(ltr);
+      setMandat(generateMandat(d));
     }
 
     setPhase("done");
@@ -574,15 +615,15 @@ export default function TFAudit() {
   function reset() {
     setPhase("upload"); setFileName(null); setFileData(null);
     setLog([]); setExtracted(null); setBien(EMPTY_BIEN);
-    setResult(null); setLetter(null); setErrorMsg(null);
+    setResult(null); setLetter(null); setMandat(null); setErrorMsg(null);
     setLeadEmail(""); setLeadSent(false);
   }
 
-  function downloadLetter() {
-    const blob = new Blob([letter], { type: "text/plain;charset=utf-8" });
+  function downloadText(content, filename) {
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url; a.download = "demande-fiche-6660.txt"; a.click();
+    a.href = url; a.download = filename; a.click();
     URL.revokeObjectURL(url);
   }
 
@@ -762,13 +803,26 @@ export default function TFAudit() {
             {letter && (
               <div className="bg-white rounded-xl border border-gray-200 p-4">
                 <div className="flex items-center justify-between mb-3">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-gray-400">Courrier généré</p>
-                  <button onClick={downloadLetter} className="flex items-center gap-1.5 text-xs border border-gray-300 px-3 py-1.5 rounded-lg hover:bg-gray-50 text-gray-700">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-gray-400">Courrier — demande de fiche 6660</p>
+                  <button onClick={() => downloadText(letter, "demande-fiche-6660.txt")} className="flex items-center gap-1.5 text-xs border border-gray-300 px-3 py-1.5 rounded-lg hover:bg-gray-50 text-gray-700">
                     <Download size={12} /> Télécharger
                   </button>
                 </div>
                 <pre className="text-xs font-mono text-gray-600 whitespace-pre-wrap leading-relaxed max-h-64 overflow-y-auto">{letter}</pre>
                 <p className="text-xs text-gray-400 mt-3 leading-relaxed border-t border-gray-100 pt-3">Demande d'information uniquement — pas une contestation formelle. À valider avec votre expert-comptable avant envoi.</p>
+              </div>
+            )}
+
+            {mandat && (
+              <div className="bg-white rounded-xl border border-gray-200 p-4">
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-gray-400">Modèle de mandat / procuration</p>
+                  <button onClick={() => downloadText(mandat, "mandat-procuration.txt")} className="flex items-center gap-1.5 text-xs border border-gray-300 px-3 py-1.5 rounded-lg hover:bg-gray-50 text-gray-700">
+                    <Download size={12} /> Télécharger
+                  </button>
+                </div>
+                <pre className="text-xs font-mono text-gray-600 whitespace-pre-wrap leading-relaxed max-h-64 overflow-y-auto">{mandat}</pre>
+                <p className="text-xs text-gray-400 mt-3 leading-relaxed border-t border-gray-100 pt-3">Modèle à faire signer par le client pour que votre cabinet puisse agir en son nom auprès du CDIF. À faire relire par un professionnel avant usage.</p>
               </div>
             )}
 
