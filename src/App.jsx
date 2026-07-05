@@ -32,20 +32,41 @@ async function extractPdfText(base64) {
 // side) a naive join() interleaves cells and the regexes below match the
 // wrong numbers. We rebuild real rows using each item's y position (line)
 // then sort left-to-right by x within that line before joining.
+//
+// Some PDFs (this one included) emit one item per CHARACTER rather than per
+// word or phrase. Always inserting a space between items — which is safe
+// when items are word-sized — turns "AVIS" into "A V I S" when items are
+// single letters. We use each item's own width to measure the real gap to
+// the next one: same-word kerning sits at ~0pt (letters touch or barely
+// overlap), a genuine word boundary is a few points wide. A small threshold
+// tells the two apart without needing to know the font size in advance.
+const GAP_THRESHOLD = 1.2;
 function reconstructLines(items) {
   const Y_TOLERANCE = 2;
   const rows = [];
   for (const it of items) {
-    if (!it.str || !it.str.trim()) continue;
+    if (!it.str) continue;
     const x = it.transform[4];
     const y = it.transform[5];
+    const width = it.width || 0;
     let row = rows.find(r => Math.abs(r.y - y) <= Y_TOLERANCE);
     if (!row) { row = { y, items: [] }; rows.push(row); }
-    row.items.push({ x, str: it.str });
+    row.items.push({ x, width, str: it.str });
   }
   rows.sort((a, b) => b.y - a.y); // PDF y-axis grows upward: top of page first
   return rows
-    .map(r => r.items.sort((a, b) => a.x - b.x).map(i => i.str).join(" "))
+    .map(r => {
+      const sorted = [...r.items].sort((a, b) => a.x - b.x);
+      let line = "";
+      let prevEnd = null;
+      for (const item of sorted) {
+        if (prevEnd !== null && (item.x - prevEnd) > GAP_THRESHOLD) line += " ";
+        line += item.str;
+        prevEnd = item.x + item.width;
+      }
+      return line.trim();
+    })
+    .filter(l => l.length > 0)
     .join("\n");
 }
 
@@ -288,40 +309,32 @@ function extractData(text) {
   // check than recomputing base×taux ourselves — so they take priority.
   let cotisReel = null;
   for (let i = 0; i < lines.length; i++) {
-    if (!/^Cotisation/i.test(lines[i].trim())) continue;
-    const nums = parseNumberOnlyRow(lines[i]);
+    const trimmedLine = lines[i].trim();
+    if (!/^Cotisation/i.test(trimmedLine)) continue;
+    // Strip "Cotisation", an optional year (2024/2025), and optional "lissée" —
+    // the year is easy to mistake for a real data value since it starts with
+    // a digit, which is exactly what the generic stripping loop looks for.
+    const withoutLabel = trimmedLine.replace(/^Cotisation\s*(20\d{2})?\s*(liss[ée]e)?\s*/i, "");
+    const nums = parseNumberOnlyRow(withoutLabel);
     if (!nums || !nonNullOrder) continue;
     if (nums.length === nonNullOrder.length || nums.length === nonNullOrder.length + 1) {
       cotisReel = { byIdx: realign(nums), total: nums.length === nonNullOrder.length + 1 ? nums[nums.length - 1] : null };
     }
   }
+  const cotisReelNamed = (cotisReel && colOrder) ? {
+    commune: cotisReel.byIdx[colOrder.communeIdx] ?? null,
+    epci: colOrder.epciIdx != null ? (cotisReel.byIdx[colOrder.epciIdx] ?? null) : null,
+    om: colOrder.omIdx != null ? (cotisReel.byIdx[colOrder.omIdx] ?? null) : null,
+    syndicat: (colOrder.syndIdx != null && colOrder.syndIdx !== -1) ? (cotisReel.byIdx[colOrder.syndIdx] ?? null) : null,
+    gemapi: colOrder.gemapiIdx != null ? (cotisReel.byIdx[colOrder.gemapiIdx] ?? null) : null,
+    autre: colOrder.autreIdx != null ? (cotisReel.byIdx[colOrder.autreIdx] ?? null) : null,
+  } : null;
 
-  // ---- Frais de gestion : formule légale fixe (CGI, art. 1641), pas une
-  // donnée à extraire du texte. L'État prélève 3 % de la cotisation de
-  // chaque collectivité, SAUF le syndicat de communes et la TEOM/OM qui
-  // sont taxés à 8 % (frais d'assiette + de dégrèvement, taux "établissements
-  // publics divers"). Ça ne dépend d'aucune donnée externe et ça ne peut pas
-  // devenir obsolète (le taux légal ne change pas d'une année à l'autre).
-  //
-  // Pour la cotisation de départ, on préfère les montants RÉELLEMENT imprimés
-  // par catégorie (via cotisReel) au calcul base×taux : quand un lissage est
-  // actif, le montant réellement appelé diverge légitimement du calcul brut
-  // (la hausse est étalée dans le temps) — recalculer nous-mêmes créerait un
-  // écart artificiel là où il n'y en a pas.
-  const cotis = (base, taux) => (base != null && taux != null) ? base * taux : null;
-  const reel = (origIdx) => (cotisReel && origIdx != null && origIdx !== -1 && cotisReel.byIdx[origIdx] != null) ? cotisReel.byIdx[origIdx] : null;
-  const cotisCommuneCalc = colOrder ? (reel(colOrder.communeIdx) ?? cotis(baseCommune, tauxCommune)) : cotis(baseCommune, tauxCommune);
-  const cotisEPCICalc = colOrder ? (reel(colOrder.epciIdx) ?? cotis(baseEPCI ?? baseCommune, tauxEPCI)) : cotis(baseEPCI ?? baseCommune, tauxEPCI);
-  const cotisOMCalc = colOrder ? (reel(colOrder.omIdx) ?? cotis(baseOM ?? baseCommune, tauxOM)) : cotis(baseOM ?? baseCommune, tauxOM);
-  const cotisSyndicatCalc = colOrder ? (reel(colOrder.syndIdx) ?? cotis(baseSyndicats ?? baseCommune, tauxSyndicats)) : cotis(baseSyndicats ?? baseCommune, tauxSyndicats);
-  const cotisGEMAPICalc = colOrder ? (reel(colOrder.gemapiIdx) ?? cotis(baseGEMAPI ?? baseCommune, tauxGEMAPI)) : cotis(baseGEMAPI ?? baseCommune, tauxGEMAPI);
-  const cotisAutreCalc = colOrder ? (reel(colOrder.autreIdx) ?? cotis(baseAutre ?? baseCommune, tauxAutre)) : cotis(baseAutre ?? baseCommune, tauxAutre);
-
-  const tauxReduit = [cotisCommuneCalc, cotisEPCICalc, cotisGEMAPICalc, cotisAutreCalc].filter(v => v != null);
-  const tauxEleve = [cotisOMCalc, cotisSyndicatCalc].filter(v => v != null);
-  const fraisGestionCalc = (tauxReduit.length || tauxEleve.length)
-    ? Math.round(tauxReduit.reduce((a, b) => a + b, 0) * 0.03 + tauxEleve.reduce((a, b) => a + b, 0) * 0.08)
-    : null;
+  const { fraisGestion: fraisGestionCalc, sousTotalCotisations, montantRecalcule } = computeExactness({
+    baseCommune, baseEPCI, baseOM, baseSyndicats, baseGEMAPI, baseAutre,
+    tauxCommune, tauxEPCI, tauxOM, tauxSyndicats, tauxGEMAPI, tauxAutre,
+    cotisReel: cotisReelNamed
+  });
 
   // ---- Cotisations N-1 / N ----
   // Some avis spell this out explicitly ("Cotisation 2024 : X€ / Cotisation
@@ -364,15 +377,6 @@ function extractData(text) {
   const refMatch = t.match(/R[ée]f[ée]rences?\s+administratives?\s*:?\s*((?:\d{1,3}\s+){3,7}[A-Z](?:\s+[A-Z])?)/i);
   const referenceAdministrative = refMatch ? refMatch[1].trim().replace(/\s+/g, " ") : null;
 
-  // ---- Total recalculé, exact ----
-  // Round each category's cotisation individually (DGFiP rounds per line
-  // before summing, which is why a naive "round the grand total" approach
-  // drifts by a few euros), then add the legally-fixed frais de gestion.
-  const cotisationsRounded = [cotisCommuneCalc, cotisEPCICalc, cotisOMCalc, cotisSyndicatCalc, cotisGEMAPICalc, cotisAutreCalc]
-    .filter(v => v != null).map(v => Math.round(v));
-  const sousTotalCotisations = cotisationsRounded.length ? cotisationsRounded.reduce((a, b) => a + b, 0) : null;
-  const montantRecalcule = (sousTotalCotisations != null && fraisGestion != null) ? sousTotalCotisations + fraisGestion : null;
-
   return {
     entreprise, adresse, commune, departement, annee, referenceAdministrative,
     baseCommune, baseIntercommunalite,
@@ -382,6 +386,38 @@ function extractData(text) {
     sousTotalCotisations, montantRecalcule,
     lissage, lissageMontantAnnuel, lissageDebut, lissageDuree
   };
+}
+
+// ---- Couche 1 : arithmétique exacte, réutilisable par n'importe quelle
+// méthode d'extraction (regex locale ou extraction via Claude). Formule
+// légale fixe (CGI art. 1641) : 3 % de frais de gestion sur la cotisation de
+// chaque collectivité, sauf syndicat de communes et OM/TEOM à 8 %. Ne dépend
+// d'aucune donnée externe et ne devient jamais obsolète.
+function computeExactness({ baseCommune, baseEPCI, baseOM, baseSyndicats, baseGEMAPI, baseAutre, tauxCommune, tauxEPCI, tauxOM, tauxSyndicats, tauxGEMAPI, tauxAutre, cotisReel }) {
+  const cotis = (base, taux) => (base != null && taux != null) ? base * taux : null;
+  const reel = (key) => (cotisReel && cotisReel[key] != null) ? cotisReel[key] : null;
+  const cotisCommuneCalc = reel("commune") ?? cotis(baseCommune, tauxCommune);
+  const cotisEPCICalc = reel("epci") ?? cotis(baseEPCI ?? baseCommune, tauxEPCI);
+  const cotisOMCalc = reel("om") ?? cotis(baseOM ?? baseCommune, tauxOM);
+  const cotisSyndicatCalc = reel("syndicat") ?? cotis(baseSyndicats ?? baseCommune, tauxSyndicats);
+  const cotisGEMAPICalc = reel("gemapi") ?? cotis(baseGEMAPI ?? baseCommune, tauxGEMAPI);
+  const cotisAutreCalc = reel("autre") ?? cotis(baseAutre ?? baseCommune, tauxAutre);
+
+  const tauxReduit = [cotisCommuneCalc, cotisEPCICalc, cotisGEMAPICalc, cotisAutreCalc].filter(v => v != null);
+  const tauxEleve = [cotisOMCalc, cotisSyndicatCalc].filter(v => v != null);
+  const fraisGestion = (tauxReduit.length || tauxEleve.length)
+    ? Math.round(tauxReduit.reduce((a, b) => a + b, 0) * 0.03 + tauxEleve.reduce((a, b) => a + b, 0) * 0.08)
+    : null;
+
+  // Round each category's cotisation individually (DGFiP rounds per line
+  // before summing, which is why a naive "round the grand total" approach
+  // drifts by a few euros), then add the legally-fixed frais de gestion.
+  const cotisationsRounded = [cotisCommuneCalc, cotisEPCICalc, cotisOMCalc, cotisSyndicatCalc, cotisGEMAPICalc, cotisAutreCalc]
+    .filter(v => v != null).map(v => Math.round(v));
+  const sousTotalCotisations = cotisationsRounded.length ? cotisationsRounded.reduce((a, b) => a + b, 0) : null;
+  const montantRecalcule = (sousTotalCotisations != null && fraisGestion != null) ? sousTotalCotisations + fraisGestion : null;
+
+  return { fraisGestion, sousTotalCotisations, montantRecalcule };
 }
 
 // ---- Pure JS letter template — zero API ----
@@ -542,6 +578,84 @@ const DEPENDANCES_ELEMENTS = [
 ];
 const EMPTY_BIEN = { superficie: "", type: "", etat: "", anneeConstruction: "", confort: [], dependances: [] };
 
+// ---- Extraction "intelligente" : Claude d'abord (robuste à tout format de
+// document), repli automatique sur le parser local si l'appel échoue (pas de
+// clé API configurée, panne réseau, quota dépassé...). La Couche 1
+// (arithmétique exacte) est calculée de la même façon quelle que soit la
+// source des données brutes — computeExactness() ne se soucie pas d'où
+// viennent base/taux/cotisations.
+async function extractDataSmart(text, addLog) {
+  try {
+    const res = await fetch("/api/extract-tf", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (res.ok) {
+      const raw = await res.json();
+      if (raw && !raw.error) {
+        addLog?.("Extraction via Claude (robuste au format)");
+        return convertClaudeExtraction(raw);
+      }
+    }
+    addLog?.("Extraction Claude indisponible, repli sur le parser local");
+  } catch (e) {
+    addLog?.("Extraction Claude indisponible, repli sur le parser local");
+  }
+  return extractData(text);
+}
+
+function convertClaudeExtraction(raw) {
+  const frac = v => (typeof v === "number" ? v / 100 : null);
+  const baseCommune = typeof raw.baseCommune === "number" ? Math.round(raw.baseCommune) : null;
+  const baseEPCI = typeof raw.baseEPCI === "number" ? Math.round(raw.baseEPCI) : null;
+  const baseOM = typeof raw.baseOM === "number" ? Math.round(raw.baseOM) : null;
+  const baseSyndicats = typeof raw.baseSyndicats === "number" ? Math.round(raw.baseSyndicats) : null;
+  const baseGEMAPI = typeof raw.baseGEMAPI === "number" ? Math.round(raw.baseGEMAPI) : null;
+  const baseAutre = typeof raw.baseAutre === "number" ? Math.round(raw.baseAutre) : null;
+  const tauxCommune = frac(raw.tauxCommune);
+  const tauxEPCI = frac(raw.tauxEPCI);
+  const tauxOM = frac(raw.tauxOM);
+  const tauxSyndicats = raw.tauxSyndicats === 0 ? 0 : frac(raw.tauxSyndicats);
+  const tauxGEMAPI = frac(raw.tauxGEMAPI);
+  const tauxAutre = frac(raw.tauxAutre);
+
+  const cotisReel = {
+    commune: typeof raw.cotisationCommune === "number" ? raw.cotisationCommune : null,
+    epci: typeof raw.cotisationEPCI === "number" ? raw.cotisationEPCI : null,
+    om: typeof raw.cotisationOM === "number" ? raw.cotisationOM : null,
+    syndicat: typeof raw.cotisationSyndicats === "number" ? raw.cotisationSyndicats : null,
+    gemapi: typeof raw.cotisationGEMAPI === "number" ? raw.cotisationGEMAPI : null,
+    autre: typeof raw.cotisationAutre === "number" ? raw.cotisationAutre : null,
+  };
+
+  const { fraisGestion: fraisGestionCalc, sousTotalCotisations, montantRecalcule } = computeExactness({
+    baseCommune, baseEPCI, baseOM, baseSyndicats, baseGEMAPI, baseAutre,
+    tauxCommune, tauxEPCI, tauxOM, tauxSyndicats, tauxGEMAPI, tauxAutre,
+    cotisReel
+  });
+
+  return {
+    entreprise: raw.entreprise ?? null,
+    adresse: raw.adresse ?? null,
+    commune: raw.commune ?? null,
+    departement: raw.departement ?? null,
+    annee: typeof raw.annee === "number" ? raw.annee : 2025,
+    referenceAdministrative: raw.referenceAdministrative ?? null,
+    baseCommune, baseIntercommunalite: baseEPCI ?? baseCommune,
+    tauxCommune, tauxEPCI, tauxOM, tauxSyndicats, tauxGEMAPI, tauxAutre,
+    cotisationCommune2024: null,
+    cotisationLisseeCommune2025: typeof raw.cotisationTotal === "number" ? Math.round(raw.cotisationTotal) : (sousTotalCotisations ?? null),
+    montantTotal: typeof raw.montantTotal === "number" ? raw.montantTotal : null,
+    fraisGestion: typeof raw.fraisGestion === "number" ? Math.round(raw.fraisGestion) : fraisGestionCalc,
+    sousTotalCotisations, montantRecalcule,
+    lissage: !!raw.lissage,
+    lissageMontantAnnuel: raw.lissageMontantAnnuel ?? null,
+    lissageDebut: raw.lissageDebut ?? null,
+    lissageDuree: raw.lissageDuree ?? null,
+  };
+}
+
 // ---- Main component ----
 export default function TFAudit() {
   const [phase, setPhase] = useState("upload");
@@ -599,7 +713,7 @@ export default function TFAudit() {
           lissage: true, lissageMontantAnnuel: 10, lissageDebut: 2017, lissageDuree: 10
         };
       } else {
-        d = extractData(text);
+        d = await extractDataSmart(text, addLog);
       }
 
       setExtracted(d);
@@ -724,6 +838,7 @@ export default function TFAudit() {
             <div>
               <h1 className="text-lg font-bold text-gray-900">Votre taxe foncière est-elle correcte ?</h1>
               <p className="text-sm text-gray-500 mt-1 leading-relaxed">Uploadez l'avis PDF (depuis impots.gouv.fr). L'outil détecte les anomalies et génère le courrier pour demander le détail du calcul à l'administration.</p>
+              <p className="text-xs text-gray-400 mt-2 leading-relaxed">Le texte de votre avis peut être analysé de façon sécurisée pour en extraire les données — il n'est jamais stocké ni utilisé pour entraîner un modèle.</p>
             </div>
             <label htmlFor="file-up" className="block border-2 border-dashed border-gray-200 hover:border-blue-400 rounded-xl p-6 text-center cursor-pointer transition-colors">
               <input id="file-up" type="file" accept=".pdf,image/*" onChange={handleFile} className="hidden" />
@@ -951,14 +1066,14 @@ export default function TFAudit() {
                       Être recontacté
                     </button>
                   </div>
-                </form>
-              ) : (
-                <div className="flex items-center gap-2">
-                  <CheckCircle2 size={18} className="text-green-400" />
-                  <p className="text-sm">Merci ! On revient vers vous sous 48h.</p>
-                </div>
-              )}
-            </div>
+                  </form>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <CheckCircle2 size={18} className="text-green-400" />
+                    <p className="text-sm">Merci ! On revient vers vous sous 48h.</p>
+                  </div>
+                )}
+              </div>
           </>
         )}
       </div>
