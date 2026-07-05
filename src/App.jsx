@@ -306,6 +306,33 @@ function extractData(text) {
   };
 }
 
+// ---- Vérification officielle des taux via DGFiP REI (data.economie.gouv.fr) ----
+// CORS: access-control-allow-origin: * → appel direct navigateur, pas de serverless.
+// Champs utiles : taux_global_tfb (commune+EPCI+syndicats+GEMAPI, sans TEOM),
+//                 taux_plein_teom (ordures ménagères, facturé séparément),
+//                 e12vote (taux communal seul), exercice (année du jeu de données).
+async function fetchTauxOfficiel(commune, dep) {
+  if (!commune || !dep) return null;
+  try {
+    const name = encodeURIComponent(commune.trim().toUpperCase());
+    const depPadded = String(dep).padStart(2, "0");
+    const url = `https://data.economie.gouv.fr/api/explore/v2.1/catalog/datasets/fiscalite-locale-des-particuliers/records?where=libcom%3D%22${name}%22%20and%20dep%3D%22${depPadded}%22&order_by=exercice%20desc&limit=1&select=exercice%2Ctaux_global_tfb%2Ce12vote%2Ctaux_plein_teom`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const r = data.results?.[0];
+    if (!r || r.taux_global_tfb == null) return null;
+    return {
+      exercice: parseInt(r.exercice),
+      tauxGlobalTFPB: r.taux_global_tfb,  // % (ex : 56,17) commune+EPCI+syndicats+GEMAPI
+      tauxCommuneOfficiel: r.e12vote,       // % taux communal seul
+      tauxTEOM: r.taux_plein_teom           // % ordures ménagères
+    };
+  } catch {
+    return null;
+  }
+}
+
 // ---- Pure JS letter template — zero API ----
 function generateLetter(d, anomalies) {
   const today = new Date().toLocaleDateString("fr-FR", { day: "numeric", month: "long", year: "numeric" });
@@ -474,7 +501,11 @@ export default function TFAudit() {
         d = extractData(text);
       }
 
-      setExtracted(d);
+      addLog("Vérification des taux officiels DGFiP REI…");
+      const tauxOfficiel = await fetchTauxOfficiel(d.commune, d.departement);
+      if (tauxOfficiel) addLog(`Taux REI ${tauxOfficiel.exercice} trouvé pour ${d.commune}`);
+      else addLog("Commune non trouvée dans le REI (taux officiel indisponible)");
+      setExtracted({ ...d, tauxOfficiel });
       setPhase("bien");
     } catch (e) {
       setErrorMsg(e?.message || String(e));
@@ -533,9 +564,39 @@ export default function TFAudit() {
         detail: `Un bien ${bien.anneeConstruction ? `construit en ${bien.anneeConstruction} ` : ""}en "${bien.etat || "état non précisé"}" bénéficie parfois d'un abattement pour vétusté non appliqué. À vérifier sur la fiche d'évaluation 6660.` });
     }
 
-    checks.push({ id: "taux", status: "info",
-      label: "Taux communal — vérification manuelle",
-      detail: `${pct(d.tauxCommune)} affiché pour ${d.commune || "?"} en ${d.annee}. À comparer au taux officiel voté (disponible sur impots.gouv.fr ou auprès de la mairie).` });
+    if (d.tauxOfficiel) {
+      const off = d.tauxOfficiel;
+      // Taux global extrait du PDF = commune + EPCI + syndicats + GEMAPI (sans TEOM)
+      const tauxGlobalExtrait = ((d.tauxCommune || 0) + (d.tauxEPCI || 0) + (d.tauxSyndicats || 0) + (d.tauxGEMAPI || 0) + (d.tauxAutre || 0)) * 100;
+      const ecartGlobal = tauxGlobalExtrait - off.tauxGlobalTFPB;
+      const flagGlobal = Math.abs(ecartGlobal) > 1.5;
+      if (flagGlobal) score += 40;
+      // Taux TEOM (ordures ménagères) comparé séparément
+      const ecartTEOM = off.tauxTEOM != null ? ((d.tauxOM || 0) * 100) - off.tauxTEOM : null;
+      const flagTEOM = ecartTEOM != null && Math.abs(ecartTEOM) > 1;
+      if (flagTEOM) score += 20;
+      // Signaler clairement si les données REI sont d'une année antérieure
+      const dateLag = off.exercice < d.annee;
+      const yearNote = dateLag
+        ? ` ⚠ Données REI disponibles jusqu'à ${off.exercice} — le taux ${d.annee} n'est pas encore publié.`
+        : "";
+      checks.push({ id: "tauxOfficiel", status: flagGlobal ? "flag" : "ok",
+        label: `Taux global TFPB — DGFiP REI ${off.exercice}${dateLag ? ` (⚠ données ${off.exercice}, pas ${d.annee})` : ""}`,
+        detail: flagGlobal
+          ? `Taux extrait du PDF : ${tauxGlobalExtrait.toFixed(2).replace(".", ",")} % ≠ REI ${off.exercice} : ${off.tauxGlobalTFPB.toFixed(2).replace(".", ",")} %. Écart : ${ecartGlobal > 0 ? "+" : ""}${ecartGlobal.toFixed(2).replace(".", ",")} pp.${yearNote}`
+          : `Taux global extrait (${tauxGlobalExtrait.toFixed(2).replace(".", ",")} %) cohérent avec le REI ${off.exercice} (${off.tauxGlobalTFPB.toFixed(2).replace(".", ",")} %).${yearNote}` });
+      if (ecartTEOM != null) {
+        checks.push({ id: "tauxTEOM", status: flagTEOM ? "flag" : "ok",
+          label: `Taux TEOM (ordures ménagères) — DGFiP REI ${off.exercice}`,
+          detail: flagTEOM
+            ? `TEOM extrait : ${((d.tauxOM || 0) * 100).toFixed(2).replace(".", ",")} % ≠ REI ${off.exercice} : ${off.tauxTEOM.toFixed(2).replace(".", ",")} %. Écart : ${ecartTEOM > 0 ? "+" : ""}${ecartTEOM.toFixed(2).replace(".", ",")} pp.${yearNote}`
+            : `TEOM extraite (${((d.tauxOM || 0) * 100).toFixed(2).replace(".", ",")} %) cohérente avec le REI ${off.exercice} (${off.tauxTEOM.toFixed(2).replace(".", ",")} %).${yearNote}` });
+      }
+    } else {
+      checks.push({ id: "taux", status: "info",
+        label: "Taux communal — vérification manuelle",
+        detail: `${pct(d.tauxCommune)} affiché pour ${d.commune || "?"} en ${d.annee}. Commune non trouvée dans le REI DGFiP — à comparer manuellement sur impots.gouv.fr ou auprès de la mairie.` });
+    }
 
     score = Math.min(100, score);
     const trisAnnuel = ecartMontant != null && ecartMontant > 5 ? ecartMontant : 0;
