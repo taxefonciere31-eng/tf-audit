@@ -306,33 +306,6 @@ function extractData(text) {
   };
 }
 
-// ---- Vérification officielle des taux via DGFiP REI (data.economie.gouv.fr) ----
-// CORS: access-control-allow-origin: * → appel direct navigateur, pas de serverless.
-// Champs utiles : taux_global_tfb (commune+EPCI+syndicats+GEMAPI, sans TEOM),
-//                 taux_plein_teom (ordures ménagères, facturé séparément),
-//                 e12vote (taux communal seul), exercice (année du jeu de données).
-async function fetchTauxOfficiel(commune, dep) {
-  if (!commune || !dep) return null;
-  try {
-    const name = encodeURIComponent(commune.trim().toUpperCase());
-    const depPadded = String(dep).padStart(2, "0");
-    const url = `https://data.economie.gouv.fr/api/explore/v2.1/catalog/datasets/fiscalite-locale-des-particuliers/records?where=libcom%3D%22${name}%22%20and%20dep%3D%22${depPadded}%22&order_by=exercice%20desc&limit=1&select=exercice%2Ctaux_global_tfb%2Ce12vote%2Ctaux_plein_teom`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const r = data.results?.[0];
-    if (!r || r.taux_global_tfb == null) return null;
-    return {
-      exercice: parseInt(r.exercice),
-      tauxGlobalTFPB: r.taux_global_tfb,  // % (ex : 56,17) commune+EPCI+syndicats+GEMAPI
-      tauxCommuneOfficiel: r.e12vote,       // % taux communal seul
-      tauxTEOM: r.taux_plein_teom           // % ordures ménagères
-    };
-  } catch {
-    return null;
-  }
-}
-
 // ---- Pure JS letter template — zero API ----
 function generateLetter(d, anomalies) {
   const today = new Date().toLocaleDateString("fr-FR", { day: "numeric", month: "long", year: "numeric" });
@@ -441,7 +414,14 @@ function Row({ label, value, flag }) {
 
 const TYPES_BIEN = ["Appartement", "Maison", "Local commercial", "Bureau", "Autre"];
 const ETATS_BIEN = ["Bon état", "État moyen", "Vétuste / à rénover"];
-const EMPTY_BIEN = { superficie: "", type: "", etat: "", dpe: "", anneeConstruction: "" };
+const CONFORT_ELEMENTS = [
+  { id: "chauffageCentral", label: "Chauffage central" },
+  { id: "salleBain", label: "Salle de bain (baignoire/douche)" },
+  { id: "wcIndividuel", label: "WC individuels" },
+  { id: "toutALegout", label: "Tout-à-l'égout" },
+  { id: "ascenseur", label: "Ascenseur (immeuble collectif)" },
+];
+const EMPTY_BIEN = { superficie: "", type: "", etat: "", anneeConstruction: "", confort: [] };
 
 // ---- Main component ----
 export default function TFAudit() {
@@ -501,11 +481,7 @@ export default function TFAudit() {
         d = extractData(text);
       }
 
-      addLog("Vérification des taux officiels DGFiP REI…");
-      const tauxOfficiel = await fetchTauxOfficiel(d.commune, d.departement);
-      if (tauxOfficiel) addLog(`Taux REI ${tauxOfficiel.exercice} trouvé pour ${d.commune}`);
-      else addLog("Commune non trouvée dans le REI (taux officiel indisponible)");
-      setExtracted({ ...d, tauxOfficiel });
+      setExtracted(d);
       setPhase("bien");
     } catch (e) {
       setErrorMsg(e?.message || String(e));
@@ -557,46 +533,21 @@ export default function TFAudit() {
     }
 
     // État déclaratif du bien (formulaire court) — signal supplémentaire, pas encore vérifiable
-    // automatiquement, mais on l'expose comme point de contrôle qualitatif.
-    if (bien.etat === "Vétuste / à rénover" || (bien.anneeConstruction && parseInt(bien.anneeConstruction) < 1975)) {
+    // automatiquement (nécessite la fiche 6660), mais on l'expose comme point de contrôle qualitatif
+    // ancré sur les vrais critères de la surface pondérée (art. 324 T-U, annexe III CGI), pas des
+    // catégories génériques — pour donner une hypothèse concrète à vérifier plutôt qu'un flag vague.
+    const confortManquants = CONFORT_ELEMENTS.filter(el => !bien.confort.includes(el.id)).map(el => el.label);
+    const bienAncien = bien.anneeConstruction && parseInt(bien.anneeConstruction) < 1975;
+    const bienVetuste = bien.etat === "Vétuste / à rénover";
+    if (bienVetuste || bienAncien) {
       score += 10;
-      checks.push({ id: "vetuste", status: "flag", label: "Bien ancien / état dégradé déclaré",
-        detail: `Un bien ${bien.anneeConstruction ? `construit en ${bien.anneeConstruction} ` : ""}en "${bien.etat || "état non précisé"}" bénéficie parfois d'un abattement pour vétusté non appliqué. À vérifier sur la fiche d'évaluation 6660.` });
+      checks.push({ id: "vetuste", status: "flag", label: "Écart possible sur la surface pondérée",
+        detail: `Bien ${bien.anneeConstruction ? `construit en ${bien.anneeConstruction} ` : ""}déclaré en "${bien.etat || "état non précisé"}"${confortManquants.length ? `, sans ${confortManquants.slice(0, 2).join(" ni ")}` : ""}. La valeur locative repose sur une surface pondérée (état d'entretien + éléments de confort) fixée en 1970 et rarement mise à jour depuis — un abattement pour vétusté ou l'absence de certains éléments de confort dans le calcul officiel peut ne pas être reflété. À vérifier sur la fiche d'évaluation 6660 auprès du CDIF.` });
     }
 
-    if (d.tauxOfficiel) {
-      const off = d.tauxOfficiel;
-      // Taux global extrait du PDF = commune + EPCI + syndicats + GEMAPI (sans TEOM)
-      const tauxGlobalExtrait = ((d.tauxCommune || 0) + (d.tauxEPCI || 0) + (d.tauxSyndicats || 0) + (d.tauxGEMAPI || 0) + (d.tauxAutre || 0)) * 100;
-      const ecartGlobal = tauxGlobalExtrait - off.tauxGlobalTFPB;
-      const flagGlobal = Math.abs(ecartGlobal) > 1.5;
-      if (flagGlobal) score += 40;
-      // Taux TEOM (ordures ménagères) comparé séparément
-      const ecartTEOM = off.tauxTEOM != null ? ((d.tauxOM || 0) * 100) - off.tauxTEOM : null;
-      const flagTEOM = ecartTEOM != null && Math.abs(ecartTEOM) > 1;
-      if (flagTEOM) score += 20;
-      // Signaler clairement si les données REI sont d'une année antérieure
-      const dateLag = off.exercice < d.annee;
-      const yearNote = dateLag
-        ? ` ⚠ Données REI disponibles jusqu'à ${off.exercice} — le taux ${d.annee} n'est pas encore publié.`
-        : "";
-      checks.push({ id: "tauxOfficiel", status: flagGlobal ? "flag" : "ok",
-        label: `Taux global TFPB — DGFiP REI ${off.exercice}${dateLag ? ` (⚠ données ${off.exercice}, pas ${d.annee})` : ""}`,
-        detail: flagGlobal
-          ? `Taux extrait du PDF : ${tauxGlobalExtrait.toFixed(2).replace(".", ",")} % ≠ REI ${off.exercice} : ${off.tauxGlobalTFPB.toFixed(2).replace(".", ",")} %. Écart : ${ecartGlobal > 0 ? "+" : ""}${ecartGlobal.toFixed(2).replace(".", ",")} pp.${yearNote}`
-          : `Taux global extrait (${tauxGlobalExtrait.toFixed(2).replace(".", ",")} %) cohérent avec le REI ${off.exercice} (${off.tauxGlobalTFPB.toFixed(2).replace(".", ",")} %).${yearNote}` });
-      if (ecartTEOM != null) {
-        checks.push({ id: "tauxTEOM", status: flagTEOM ? "flag" : "ok",
-          label: `Taux TEOM (ordures ménagères) — DGFiP REI ${off.exercice}`,
-          detail: flagTEOM
-            ? `TEOM extrait : ${((d.tauxOM || 0) * 100).toFixed(2).replace(".", ",")} % ≠ REI ${off.exercice} : ${off.tauxTEOM.toFixed(2).replace(".", ",")} %. Écart : ${ecartTEOM > 0 ? "+" : ""}${ecartTEOM.toFixed(2).replace(".", ",")} pp.${yearNote}`
-            : `TEOM extraite (${((d.tauxOM || 0) * 100).toFixed(2).replace(".", ",")} %) cohérente avec le REI ${off.exercice} (${off.tauxTEOM.toFixed(2).replace(".", ",")} %).${yearNote}` });
-      }
-    } else {
-      checks.push({ id: "taux", status: "info",
-        label: "Taux communal — vérification manuelle",
-        detail: `${pct(d.tauxCommune)} affiché pour ${d.commune || "?"} en ${d.annee}. Commune non trouvée dans le REI DGFiP — à comparer manuellement sur impots.gouv.fr ou auprès de la mairie.` });
-    }
+    checks.push({ id: "taux", status: "info",
+      label: "Taux communal — vérification manuelle",
+      detail: `${pct(d.tauxCommune)} affiché pour ${d.commune || "?"} en ${d.annee}. À comparer au taux officiel voté (disponible sur impots.gouv.fr ou auprès de la mairie).` });
 
     score = Math.min(100, score);
     const trisAnnuel = ecartMontant != null && ecartMontant > 5 ? ecartMontant : 0;
@@ -722,21 +673,29 @@ export default function TFAudit() {
               </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="block text-xs font-semibold uppercase tracking-wide text-gray-400 mb-1.5">DPE</label>
-                <select value={bien.dpe} onChange={e => setBien(b => ({ ...b, dpe: e.target.value }))}
-                  className="w-full border border-gray-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-blue-400">
-                  <option value="">—</option>
-                  {["A","B","C","D","E","F","G"].map(l => <option key={l} value={l}>{l}</option>)}
-                </select>
+            <div>
+              <label className="block text-xs font-semibold uppercase tracking-wide text-gray-400 mb-1.5">Éléments de confort présents</label>
+              <p className="text-xs text-gray-400 mb-2 leading-relaxed">Ces éléments entrent directement dans le calcul officiel de la surface pondérée (art. 324 T-U, annexe III CGI) — pas le DPE, qui n'y figure pas.</p>
+              <div className="grid grid-cols-1 gap-2">
+                {CONFORT_ELEMENTS.map(({ id, label }) => {
+                  const checked = bien.confort.includes(id);
+                  return (
+                    <button type="button" key={id}
+                      onClick={() => setBien(b => ({ ...b, confort: checked ? b.confort.filter(c => c !== id) : [...b.confort, id] }))}
+                      className={`text-sm py-2.5 rounded-lg border text-left px-3 flex items-center justify-between transition-colors ${checked ? "bg-gray-900 text-white border-gray-900" : "border-gray-200 text-gray-700 hover:border-gray-400"}`}>
+                      {label}
+                      {checked && <CheckCircle2 size={15} />}
+                    </button>
+                  );
+                })}
               </div>
-              <div>
-                <label className="block text-xs font-semibold uppercase tracking-wide text-gray-400 mb-1.5">Année construction</label>
-                <input type="number" min="1800" max="2026" value={bien.anneeConstruction}
-                  onChange={e => setBien(b => ({ ...b, anneeConstruction: e.target.value }))}
-                  className="w-full border border-gray-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-blue-400" placeholder="ex : 1998" />
-              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold uppercase tracking-wide text-gray-400 mb-1.5">Année construction</label>
+              <input type="number" min="1800" max="2026" value={bien.anneeConstruction}
+                onChange={e => setBien(b => ({ ...b, anneeConstruction: e.target.value }))}
+                className="w-full border border-gray-200 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-blue-400" placeholder="ex : 1998" />
             </div>
 
             <button type="submit" className="w-full bg-gray-900 text-white py-3 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 hover:bg-gray-700 transition-colors">
