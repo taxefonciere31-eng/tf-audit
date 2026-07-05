@@ -92,20 +92,30 @@ function extractData(text) {
   const proprioMatch = t.match(/SCI\s+[\w\s]+|SARL\s+[\w\s]+|SAS\s+[\w\s]+|EURL\s+[\w\s]+|M[MR]\.\s+[\w\s]+/i);
   const entreprise = proprioMatch ? proprioMatch[0].trim().slice(0, 40) : null;
 
-  // Commune — no reliable "Commune : X" label exists on this document type
-  // (avis d'échéances). The commune name instead appears as a standalone
-  // all-caps line right before "Montant de vos/votre taxe(s) foncière(s)".
-  const montantLineIdx = lines.findIndex(l => /Montant\s+de\s+(vos|votre)\s+tax(es?)?\s+fonci.re/i.test(l) || /Montant\s+de\s+votre\s+imp.t/i.test(l));
+  // Commune — try the reliable "Commune d'imposition : XX <NOM>" label first
+  // (present on the main avis), then fall back to the "standalone caps line
+  // before Montant de..." heuristic used on the avis d'échéances, which
+  // doesn't have that label at all.
   let commune = null;
-  if (montantLineIdx > 0) {
-    for (let i = montantLineIdx - 1; i >= Math.max(0, montantLineIdx - 3); i--) {
-      const candidate = lines[i].trim();
+  const communeLabelIdx = lines.findIndex(l => /Commune\s*d.imposition/i.test(l));
+  if (communeLabelIdx !== -1) {
+    for (let j = 0; j <= 2 && communeLabelIdx + j < lines.length; j++) {
+      const candidate = lines[communeLabelIdx + j].replace(/Commune\s*d.imposition\s*:?\s*\d*/i, "").trim();
       if (/^[A-ZÀ-Ÿ][A-ZÀ-Ÿ\-\s]{2,30}$/.test(candidate)) { commune = candidate; break; }
     }
   }
   if (!commune) {
-    const communeMatch = t.match(/commune\s+d.imposition\s*:?\s*(\d+)?\s*([A-Z][A-Z\-\s]+)/i);
-    commune = communeMatch ? communeMatch[communeMatch.length - 1].trim().slice(0, 30) : null;
+    const montantLineIdx = lines.findIndex(l => /Montant\s+de\s+(vos|votre)\s+tax(es?)?\s+fonci.re/i.test(l) || /Montant\s+de\s+votre\s+imp.t/i.test(l));
+    if (montantLineIdx > 0) {
+      for (let i = montantLineIdx - 1; i >= Math.max(0, montantLineIdx - 3); i--) {
+        const candidate = lines[i].trim();
+        if (/^[A-ZÀ-Ÿ][A-ZÀ-Ÿ\-\s]{2,30}$/.test(candidate)) { commune = candidate; break; }
+      }
+    }
+  }
+  if (!commune) {
+    const communeMatch = t.match(/commune\s+de\s*:?\s*\n?\s*([A-Z][A-Z\-\s]+)/i);
+    commune = communeMatch ? communeMatch[1].trim().slice(0, 30) : null;
   }
 
   // Département — derive from any 5-digit postal code in the document (first
@@ -119,35 +129,57 @@ function extractData(text) {
 
   // Année — "Montant de vos taxes foncières 3685,00 ¤" was wrongly matched as
   // a year before (3685 IS 4 digits!). Anchor instead on the specific sentence
-  // that introduces the rate table: "...sont les suivantes pour 2025 :".
-  const anneeMatch = t.match(/suivantes\s+pour\s+(\d{4})\s*:/i) || t.match(/exercice\s+(\d{4})/i);
+  // that introduces the rate table, or on "Taxes foncières pour YYYY" / "Taux YYYY".
+  const anneeMatch = t.match(/suivantes\s+pour\s+(\d{4})\s*:/i) || t.match(/exercice\s+(\d{4})/i)
+    || t.match(/Taxes\s+fonci.res\s+pour\s+(\d{4})/i) || t.match(/Taux\s*(\d{4})/i);
   const anneeCandidate = anneeMatch ? parseInt(anneeMatch[1]) : null;
   const annee = (anneeCandidate && anneeCandidate > 2015 && anneeCandidate < 2035) ? anneeCandidate : 2025;
 
   // ---- Taux, per collectivité ----
-  // The real table has no per-row labels — just two lines of 6 numbers each
-  // (previous year, then current year). Rather than trust column *position*
-  // (which can vary between documents), we classify by two more reliable
-  // signals: (1) a narrative sentence sometimes states a specific collectivité's
-  // rate change directly ("le taux relatif au syndicat... passe de 5,39 % à
-  // 4,91 %") — an exact, unambiguous anchor when present; (2) failing that,
-  // rate *magnitude* is a decent proxy since these categories have
-  // structurally different typical ranges (commune is always the largest;
-  // GEMAPI is always tiny, under ~1%).
-  const pctRowRe = /^(\d{1,3}[,\.]\d{1,3})\s+(\d{1,3}[,\.]\d{1,3})\s+(\d{1,3}[,\.]\d{1,3})\s+(\d{1,3}[,\.]\d{1,3})\s+(\d{1,3}[,\.]\d{1,3})\s+(\d{1,3}[,\.]\d{1,3})$/;
+  // Two real layouts seen so far: (a) a bare line of 6 space-separated
+  // numbers with no label and no "%" (avis d'échéances); (b) a labeled line
+  // like "Taux2025 50,48 % % 4,77 % 0,609 % 13,86 % 0,314 %" where a column
+  // can be entirely BLANK (no digits at all, just "%") when that tax doesn't
+  // apply to this property (e.g. no syndicat de communes). Blank columns
+  // must be preserved as null-in-place so we don't shift the remaining
+  // values into the wrong column.
+  function parseTauxLine(line) {
+    const trimmed = line.trim();
+    if (trimmed.includes("%")) {
+      const pctCount = (trimmed.match(/%/g) || []).length;
+      if (pctCount !== 6) return null;
+      // Only a line labeled "Taux..." (or with no label at all) is a real
+      // rate row — a "Variation" row also carries 6 "%" signs and must not
+      // be mistaken for one.
+      const labelMatch = trimmed.match(/^([A-Za-zÀ-ÿ]+)\s*\d{0,4}\s*/);
+      if (labelMatch && !/^taux/i.test(labelMatch[1])) return null;
+      const stripped = labelMatch ? trimmed.slice(labelMatch[0].length) : trimmed;
+      const parts = stripped.split("%");
+      if (parts.length < 6) return null;
+      return parts.slice(0, 6).map(p => {
+        const m = p.match(/(\d{1,3}[,\.]\d{1,3})/);
+        return m ? parseNum(m[1]) : null;
+      });
+    }
+    const m = trimmed.match(/^(\d{1,3}[,\.]\d{1,3})\s+(\d{1,3}[,\.]\d{1,3})\s+(\d{1,3}[,\.]\d{1,3})\s+(\d{1,3}[,\.]\d{1,3})\s+(\d{1,3}[,\.]\d{1,3})\s+(\d{1,3}[,\.]\d{1,3})$/);
+    return m ? m.slice(1, 7).map(parseNum) : null;
+  }
+
   let tauxRows = [];
   let tauxRowIdx = -1;
   for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(pctRowRe);
-    if (m) { tauxRows.push(m.slice(1, 7).map(parseNum)); if (tauxRowIdx === -1) tauxRowIdx = i; }
+    const row = parseTauxLine(lines[i]);
+    if (row) { tauxRows.push(row); if (tauxRowIdx === -1) tauxRowIdx = i; }
   }
 
   let tauxCommune = null, tauxSyndicats = null, tauxEPCI = null, tauxOM = null, tauxGEMAPI = null, tauxAutre = null;
-  let colOrder = null; // remembers which column index maps to which collectivité, reused for the base row
+  let colOrder = null; // remembers which column index maps to which collectivité, reused for base/cotisation rows
+  let nonNullOrder = null; // original column indices that had a value, left-to-right — base/cotisation rows omit blank columns entirely, so this realigns them
 
   if (tauxRows.length >= 1) {
     const current = tauxRows[tauxRows.length - 1]; // most recent year = last matching row
-    const remaining = current.map((v, i) => ({ v, i }));
+    nonNullOrder = current.map((v, i) => i).filter(i => current[i] != null);
+    const remaining = nonNullOrder.map(i => ({ v: current[i], i }));
 
     // (1) Narrative anchor for syndicat, if present.
     const syndMatch = t.match(/syndicat[^%]*?(\d{1,3}[,\.]\d{1,3})\s*%?\s*(?:à|a)\s*(\d{1,3}[,\.]\d{1,3})\s*%/i);
@@ -158,25 +190,24 @@ function extractData(text) {
       if (found) syndIdx = found.i;
     }
 
-    // (2) Magnitude fallback for the rest. Once commune (largest) and
-    // syndicat (narrative-confirmed) are set aside, the remaining categories
-    // sort fairly reliably by typical magnitude: ordures ménagères (OM) is
-    // usually the biggest of what's left, then intercommunalité (EPCI), then
-    // GEMAPI — which, on real documents, is NOT always the single smallest
-    // value: some avis carry a 6th, even-smaller line (e.g. taxe spéciale
-    // d'équipement) that GEMAPI itself sits above. So GEMAPI = 3rd of the
-    // remaining pool by magnitude, not "whatever's left over".
+    // (2) Magnitude fallback for the rest: commune is always the largest;
+    // ordures ménagères (OM) is usually the biggest of what's left, then
+    // intercommunalité (EPCI), then GEMAPI. Not a perfect convention (a
+    // small unlabeled 6th tax can occasionally outrank GEMAPI or vice
+    // versa), but since both end up in the same 3%-frais-de-gestion bucket
+    // either way, a swap here doesn't affect the exactness of the recalcul —
+    // only a display label, in the rare case it happens.
     const sorted = [...remaining].sort((a, b) => b.v - a.v);
     const communeIdx = sorted[0]?.i;
     const pool = sorted.filter(x => x.i !== communeIdx && x.i !== syndIdx);
     const omIdx = pool[0]?.i;
     const epciIdx = pool[1]?.i;
     const gemapiIdx = pool[2]?.i;
-    const autreIdx = pool[3]?.i; // 6th column (e.g. taxe spéciale d'équipement) — small, unlabeled, but real
+    const autreIdx = pool[3]?.i;
 
     colOrder = { communeIdx, syndIdx, epciIdx, omIdx, gemapiIdx, autreIdx };
     tauxCommune = communeIdx != null ? current[communeIdx] / 100 : null;
-    tauxSyndicats = syndIdx != null && syndIdx !== -1 ? current[syndIdx] / 100 : null;
+    tauxSyndicats = syndIdx != null && syndIdx !== -1 ? current[syndIdx] / 100 : 0;
     tauxEPCI = epciIdx != null ? current[epciIdx] / 100 : null;
     tauxOM = omIdx != null ? current[omIdx] / 100 : null;
     tauxGEMAPI = gemapiIdx != null ? current[gemapiIdx] / 100 : null;
@@ -195,49 +226,96 @@ function extractData(text) {
     tauxGEMAPI = tauxGEMAPIStr ? parseNum(tauxGEMAPIStr) / 100 : null;
   }
 
+  // A number-only row (label stripped) used for both the "Base" row and any
+  // "Cotisation..." row — both share the same column layout as the taux row,
+  // including omitting blank columns entirely (not even a 0).
+  function parseNumberOnlyRow(line) {
+    const tokens = line.trim().split(/\s+/);
+    while (tokens.length && !/^[+\-]?\d/.test(tokens[0])) tokens.shift();
+    if (tokens.length < 3 || tokens.length > 7) return null;
+    const nums = tokens.map(tok => {
+      const m = tok.match(/^[+\-]?(\d{1,5}(?:[,\.]\d{1,3})?)$/);
+      return m ? parseNum(m[1]) : NaN;
+    });
+    return nums.some(isNaN) ? null : nums;
+  }
+
+  // Realign a number-only row (which skips blank columns just like the taux
+  // row does) back onto the original 0-5 column indices using nonNullOrder.
+  function realign(rowNums) {
+    if (!rowNums || !nonNullOrder) return null;
+    const byOrigIdx = {};
+    nonNullOrder.forEach((origIdx, k) => { if (k < rowNums.length) byOrigIdx[origIdx] = rowNums[k]; });
+    return byOrigIdx;
+  }
+
   // ---- Base d'imposition ----
-  // The base row sits right after the taux rows and shares the same 6
-  // columns — reuse colOrder from the taux classification instead of
-  // guessing again. When every column holds the same value (common: the
-  // base is often identical across collectivités), that single value is
-  // applied to all fields either way.
   let baseCommune = null, baseEPCI = null, baseOM = null, baseSyndicats = null, baseGEMAPI = null, baseAutre = null;
   const baseSearchStart = tauxRowIdx !== -1 ? tauxRowIdx : 0;
-  const baseLineIdx = lines.findIndex((l, i) => i >= baseSearchStart && /^\d+(\s+\d+){4,5}$/.test(l.trim()));
+  const baseLineIdx = lines.findIndex((l, i) => {
+    if (i < baseSearchStart) return false;
+    const trimmed = l.trim();
+    const looksLabeled = /base/i.test(trimmed);
+    const looksBareNumbers = /^\d+(\s+\d+){2,6}$/.test(trimmed);
+    return (looksLabeled || looksBareNumbers) && parseNumberOnlyRow(l);
+  });
   if (baseLineIdx !== -1) {
-    const baseNums = (lines[baseLineIdx].match(ALL_NUMS_RE) || []).map(parseNum);
-    if (baseNums.length >= 5 && colOrder) {
-      baseCommune = baseNums[colOrder.communeIdx];
-      baseEPCI = colOrder.epciIdx != null ? baseNums[colOrder.epciIdx] : null;
-      baseOM = colOrder.omIdx != null ? baseNums[colOrder.omIdx] : null;
-      baseSyndicats = colOrder.syndIdx != null && colOrder.syndIdx !== -1 ? baseNums[colOrder.syndIdx] : null;
-      baseGEMAPI = colOrder.gemapiIdx != null ? baseNums[colOrder.gemapiIdx] : null;
-      baseAutre = colOrder.autreIdx != null ? baseNums[colOrder.autreIdx] : null;
+    const baseNums = parseNumberOnlyRow(lines[baseLineIdx]);
+    if (colOrder && nonNullOrder && baseNums.length === nonNullOrder.length) {
+      const byIdx = realign(baseNums);
+      baseCommune = byIdx[colOrder.communeIdx];
+      baseEPCI = colOrder.epciIdx != null ? byIdx[colOrder.epciIdx] : null;
+      baseOM = colOrder.omIdx != null ? byIdx[colOrder.omIdx] : null;
+      baseSyndicats = colOrder.syndIdx != null && colOrder.syndIdx !== -1 ? byIdx[colOrder.syndIdx] : 0;
+      baseGEMAPI = colOrder.gemapiIdx != null ? byIdx[colOrder.gemapiIdx] : null;
+      baseAutre = colOrder.autreIdx != null ? byIdx[colOrder.autreIdx] : null;
     } else if (baseNums.length >= 1) {
       baseCommune = baseEPCI = baseOM = baseSyndicats = baseGEMAPI = baseAutre = baseNums[0];
     }
   } else {
-    const baseFallback = (t.match(/Base\s*:?\s*(\d+(?:[,\.]\d{1,2})?)\s*€/i) || [])[1];
+    const baseFallback = (t.match(/Base\s*:?\s*(\d+(?:[,\.]\d{1,2})?)\s*[€¤]/i) || [])[1];
     if (baseFallback) baseCommune = baseEPCI = baseOM = baseSyndicats = baseGEMAPI = baseAutre = parseNum(baseFallback);
   }
   baseCommune = baseCommune != null ? Math.round(baseCommune) : null;
   const baseIntercommunalite = baseEPCI != null ? Math.round(baseEPCI) : baseCommune;
 
+  // ---- Cotisation réelle par collectivité (post-lissage) ----
+  // When lissage is active, base×taux no longer equals the actual amount
+  // charged — DGFiP smooths it. The document usually prints the true,
+  // already-smoothed per-category amounts on a "Cotisation…" row (e.g.
+  // "Cotisationlissée 464 42 5 123 3 637", last number = grand total). When
+  // found, these real figures are strictly more accurate for the exactness
+  // check than recomputing base×taux ourselves — so they take priority.
+  let cotisReel = null;
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^Cotisation/i.test(lines[i].trim())) continue;
+    const nums = parseNumberOnlyRow(lines[i]);
+    if (!nums || !nonNullOrder) continue;
+    if (nums.length === nonNullOrder.length || nums.length === nonNullOrder.length + 1) {
+      cotisReel = { byIdx: realign(nums), total: nums.length === nonNullOrder.length + 1 ? nums[nums.length - 1] : null };
+    }
+  }
+
   // ---- Frais de gestion : formule légale fixe (CGI, art. 1641), pas une
   // donnée à extraire du texte. L'État prélève 3 % de la cotisation de
   // chaque collectivité, SAUF le syndicat de communes et la TEOM/OM qui
   // sont taxés à 8 % (frais d'assiette + de dégrèvement, taux "établissements
-  // publics divers"). On calcule donc chaque cotisation (base × taux) puis on
-  // applique le bon pourcentage — ça ne dépend d'aucune donnée externe et ça
-  // ne peut pas devenir obsolète (le taux légal ne change pas d'une année à
-  // l'autre, contrairement aux taux votés par les collectivités).
+  // publics divers"). Ça ne dépend d'aucune donnée externe et ça ne peut pas
+  // devenir obsolète (le taux légal ne change pas d'une année à l'autre).
+  //
+  // Pour la cotisation de départ, on préfère les montants RÉELLEMENT imprimés
+  // par catégorie (via cotisReel) au calcul base×taux : quand un lissage est
+  // actif, le montant réellement appelé diverge légitimement du calcul brut
+  // (la hausse est étalée dans le temps) — recalculer nous-mêmes créerait un
+  // écart artificiel là où il n'y en a pas.
   const cotis = (base, taux) => (base != null && taux != null) ? base * taux : null;
-  const cotisCommuneCalc = cotis(baseCommune, tauxCommune);
-  const cotisEPCICalc = cotis(baseEPCI ?? baseCommune, tauxEPCI);
-  const cotisOMCalc = cotis(baseOM ?? baseCommune, tauxOM);
-  const cotisSyndicatCalc = cotis(baseSyndicats ?? baseCommune, tauxSyndicats);
-  const cotisGEMAPICalc = cotis(baseGEMAPI ?? baseCommune, tauxGEMAPI);
-  const cotisAutreCalc = cotis(baseAutre ?? baseCommune, tauxAutre);
+  const reel = (origIdx) => (cotisReel && origIdx != null && origIdx !== -1 && cotisReel.byIdx[origIdx] != null) ? cotisReel.byIdx[origIdx] : null;
+  const cotisCommuneCalc = colOrder ? (reel(colOrder.communeIdx) ?? cotis(baseCommune, tauxCommune)) : cotis(baseCommune, tauxCommune);
+  const cotisEPCICalc = colOrder ? (reel(colOrder.epciIdx) ?? cotis(baseEPCI ?? baseCommune, tauxEPCI)) : cotis(baseEPCI ?? baseCommune, tauxEPCI);
+  const cotisOMCalc = colOrder ? (reel(colOrder.omIdx) ?? cotis(baseOM ?? baseCommune, tauxOM)) : cotis(baseOM ?? baseCommune, tauxOM);
+  const cotisSyndicatCalc = colOrder ? (reel(colOrder.syndIdx) ?? cotis(baseSyndicats ?? baseCommune, tauxSyndicats)) : cotis(baseSyndicats ?? baseCommune, tauxSyndicats);
+  const cotisGEMAPICalc = colOrder ? (reel(colOrder.gemapiIdx) ?? cotis(baseGEMAPI ?? baseCommune, tauxGEMAPI)) : cotis(baseGEMAPI ?? baseCommune, tauxGEMAPI);
+  const cotisAutreCalc = colOrder ? (reel(colOrder.autreIdx) ?? cotis(baseAutre ?? baseCommune, tauxAutre)) : cotis(baseAutre ?? baseCommune, tauxAutre);
 
   const tauxReduit = [cotisCommuneCalc, cotisEPCICalc, cotisGEMAPICalc, cotisAutreCalc].filter(v => v != null);
   const tauxEleve = [cotisOMCalc, cotisSyndicatCalc].filter(v => v != null);
@@ -247,20 +325,16 @@ function extractData(text) {
 
   // ---- Cotisations N-1 / N ----
   // Some avis spell this out explicitly ("Cotisation 2024 : X€ / Cotisation
-  // 2025 : Y€") — when that phrasing isn't present (as on an avis
-  // d'échéances), we simply can't derive a reliable N-1 total from a bare
-  // numeric grid without risking another wrong guess, so this stays null
-  // and the "évolution N-1 → N" check is skipped rather than shown wrong.
-  const cotisPairMatch = t.match(/Cotisation\s*(\d{4})[^\d€]*(\d+(?:[,\.]\d{1,2})?)\s*€.{0,30}?Cotisation\s*(\d{4})[^\d€]*(\d+(?:[,\.]\d{1,2})?)\s*€/i);
+  // 2025 : Y€"); others print a full per-category breakdown with a grand
+  // total (cotisReel.total) — prefer whichever is available.
+  const cotisPairMatch = t.match(/Cotisation\s*(\d{4})[^\d€¤]*(\d+(?:[,\.]\d{1,2})?)\s*[€¤].{0,30}?Cotisation\s*(\d{4})[^\d€¤]*(\d+(?:[,\.]\d{1,2})?)\s*[€¤]/i);
   let cotisationCommune2024 = null, cotisationLisseeCommune2025 = null;
   if (cotisPairMatch) {
     cotisationCommune2024 = Math.round(parseNum(cotisPairMatch[2]));
     cotisationLisseeCommune2025 = Math.round(parseNum(cotisPairMatch[4]));
   } else {
-    const c24 = findValue(lines, [/Cotisation\s*2024/i], NUM_RE);
-    const c25 = findValue(lines, [/Cotisation\s*2025/i, /Cotisation\s+liss.e/i], NUM_RE);
-    cotisationCommune2024 = c24 ? Math.round(parseNum(c24)) : null;
-    cotisationLisseeCommune2025 = c25 ? Math.round(parseNum(c25)) : null;
+    cotisationCommune2024 = null;
+    cotisationLisseeCommune2025 = cotisReel?.total != null ? Math.round(cotisReel.total) : null;
   }
 
   // ---- Montant total ----
@@ -277,8 +351,8 @@ function extractData(text) {
   const fraisGestion = fraisGestionCalc != null ? fraisGestionCalc : (fraisStr ? Math.round(parseNum(fraisStr)) : null);
 
   // ---- Lissage ----
-  const lissageMatch = t.match(/lissage\s+de\s+\+?\s*(\d+)\s*€?\s*par\s+an/i)
-    || t.match(/lissage.*?(\d+)\s*€\s*par\s+an/i);
+  const lissageMatch = t.match(/lissage\s+de\s+\+?\s*(\d+)\s*[€¤]?\s*par\s+an/i)
+    || t.match(/lissage.*?(\d+)\s*[€¤]\s*par\s+an/i);
   const lissage = !!lissageMatch || /lissage/i.test(t);
   const lissageMontantAnnuel = lissageMatch ? parseInt(lissageMatch[1]) : null;
   const lissageDebutMatch = t.match(/lissage.*?en\s+(\d{4})/i) || t.match(/calcul.*?en\s+(\d{4})/i);
@@ -286,8 +360,8 @@ function extractData(text) {
   const lissageDureeMatch = t.match(/(\d+)\s+ans/i);
   const lissageDuree = lissageDureeMatch ? parseInt(lissageDureeMatch[1]) : null;
 
-  // Référence administrative (identifie précisément le local pour une demande de fiche 6660)
-  const refMatch = t.match(/R[ée]f[ée]rences?\s+administratives?\s*:?\s*([\dA-Z\s]{10,30})/i);
+  // Référence administrative (identifie précisément le local pour la demande de fiche d'évaluation cadastrale)
+  const refMatch = t.match(/R[ée]f[ée]rences?\s+administratives?\s*:?\s*((?:\d{1,3}\s+){3,7}[A-Z](?:\s+[A-Z])?)/i);
   const referenceAdministrative = refMatch ? refMatch[1].trim().replace(/\s+/g, " ") : null;
 
   // ---- Total recalculé, exact ----
@@ -338,11 +412,11 @@ L'avis d'imposition fait état des éléments suivants :
 - Montant total de l'impôt : ${d.montantTotal ? d.montantTotal + " €" : "—"}
 ${d.lissage ? `- Un lissage de +${d.lissageMontantAnnuel ?? "?"}€/an est mentionné depuis ${d.lissageDebut ?? "?"}${d.lissageDuree ? ` sur une période de ${d.lissageDuree} ans` : ""}.` : ""}
 
-Après vérification, les points suivants appellent une clarification : ${anomalies}.
+Après vérification, ${anomalies ? `les points suivants appellent une clarification : ${anomalies}.` : "le calcul arithmétique de l'avis (base × taux, frais de gestion) est cohérent. Nous souhaitons néanmoins nous assurer que la valeur locative retenue reflète l'état actuel du bien, cet élément n'étant pas vérifiable depuis l'avis d'imposition seul."}
 
 Dans ce cadre, nous vous demandons de bien vouloir nous communiquer :
 
-1. La fiche d'évaluation détaillée du bien (6660-REV ou extrait GMBI), incluant :
+1. La fiche d'évaluation détaillée du bien (extrait GMBI ou fiche d'évaluation cadastrale), incluant :
    - La catégorie tarifaire retenue,
    - Le secteur d'évaluation,
    - La surface pondérée et les coefficients appliqués,
@@ -377,7 +451,7 @@ Je soussigné(e) [NOM, PRÉNOM DU CONTRIBUABLE]${d.entreprise ? ` (${d.entrepris
 
 pour me représenter auprès du Centre des Impôts Fonciers (CDIF) et de la Direction Générale des Finances Publiques (DGFiP), aux fins de :
 
-1. Demander et recevoir en mon nom la fiche d'évaluation de la valeur locative (formulaire 6660 ou extrait GMBI) du bien désigné ci-après ;
+1. Demander et recevoir en mon nom la fiche d'évaluation de la valeur locative (extrait GMBI ou fiche d'évaluation cadastrale) du bien désigné ci-après ;
 2. Consulter le détail du calcul de la taxe foncière (base, catégorie, surface pondérée, coefficients appliqués) ;
 3. Le cas échéant, engager en mon nom une démarche de réclamation ou de rectification auprès de l'administration fiscale, dans les conditions prévues par le livre des procédures fiscales.
 
@@ -460,7 +534,13 @@ const CONFORT_ELEMENTS = [
   { id: "toutALegout", label: "Tout-à-l'égout" },
   { id: "ascenseur", label: "Ascenseur (immeuble collectif)" },
 ];
-const EMPTY_BIEN = { superficie: "", type: "", etat: "", anneeConstruction: "", confort: [] };
+const DEPENDANCES_ELEMENTS = [
+  { id: "garage", label: "Garage" },
+  { id: "cave", label: "Cave" },
+  { id: "piscine", label: "Piscine" },
+  { id: "terrasseBalcon", label: "Terrasse / balcon" },
+];
+const EMPTY_BIEN = { superficie: "", type: "", etat: "", anneeConstruction: "", confort: [], dependances: [] };
 
 // ---- Main component ----
 export default function TFAudit() {
@@ -573,7 +653,7 @@ export default function TFAudit() {
     }
 
     // État déclaratif du bien (formulaire court) — signal supplémentaire, pas encore vérifiable
-    // automatiquement (nécessite la fiche 6660), mais on l'expose comme point de contrôle qualitatif
+    // automatiquement (nécessite la fiche d'évaluation cadastrale), mais on l'expose comme point de contrôle qualitatif
     // ancré sur les vrais critères de la surface pondérée (art. 324 T-U, annexe III CGI), pas des
     // catégories génériques — pour donner une hypothèse concrète à vérifier plutôt qu'un flag vague.
     const confortManquants = CONFORT_ELEMENTS.filter(el => !bien.confort.includes(el.id)).map(el => el.label);
@@ -582,7 +662,7 @@ export default function TFAudit() {
     if (bienVetuste || bienAncien) {
       score += 10;
       checks.push({ id: "vetuste", status: "flag", label: "Écart possible sur la surface pondérée",
-        detail: `Bien ${bien.anneeConstruction ? `construit en ${bien.anneeConstruction} ` : ""}déclaré en "${bien.etat || "état non précisé"}"${confortManquants.length ? `, sans ${confortManquants.slice(0, 2).join(" ni ")}` : ""}. La valeur locative repose sur une surface pondérée (état d'entretien + éléments de confort) fixée en 1970 et rarement mise à jour depuis — un abattement pour vétusté ou l'absence de certains éléments de confort dans le calcul officiel peut ne pas être reflété. À vérifier sur la fiche d'évaluation 6660 auprès du CDIF.` });
+        detail: `Bien ${bien.anneeConstruction ? `construit en ${bien.anneeConstruction} ` : ""}déclaré en "${bien.etat || "état non précisé"}"${confortManquants.length ? `, sans ${confortManquants.slice(0, 2).join(" ni ")}` : ""}. La valeur locative repose sur une surface pondérée (état d'entretien + éléments de confort) fixée en 1970 et rarement mise à jour depuis — un abattement pour vétusté ou l'absence de certains éléments de confort dans le calcul officiel peut ne pas être reflété. À vérifier sur la fiche d'évaluation cadastrale, à demander au CDIF.` });
     }
 
     checks.push({ id: "taux", status: "info",
@@ -595,12 +675,9 @@ export default function TFAudit() {
 
     setResult({ d, bien, checks, score, totalRecalc, ecartMontant, evo, revaloOff, troPerçu3Ans });
 
-    if (score > 0) {
-      const anomalies = checks.filter(c => c.status === "flag").map(c => c.label).join(", ");
-      const ltr = generateLetter(d, anomalies);
-      setLetter(ltr);
-      setMandat(generateMandat(d));
-    }
+    const anomalies = checks.filter(c => c.status === "flag").map(c => c.label).join(", ");
+    setLetter(generateLetter(d, anomalies));
+    setMandat(generateMandat(d));
 
     setPhase("done");
   }
@@ -733,6 +810,24 @@ export default function TFAudit() {
             </div>
 
             <div>
+              <label className="block text-xs font-semibold uppercase tracking-wide text-gray-400 mb-1.5">Dépendances existantes</label>
+              <p className="text-xs text-gray-400 mb-2 leading-relaxed">Une dépendance démolie ou jamais retirée du calcul officiel est une source fréquente d'écart.</p>
+              <div className="grid grid-cols-2 gap-2">
+                {DEPENDANCES_ELEMENTS.map(({ id, label }) => {
+                  const checked = bien.dependances.includes(id);
+                  return (
+                    <button type="button" key={id}
+                      onClick={() => setBien(b => ({ ...b, dependances: checked ? b.dependances.filter(c => c !== id) : [...b.dependances, id] }))}
+                      className={`text-sm py-2.5 rounded-lg border text-left px-3 flex items-center justify-between transition-colors ${checked ? "bg-gray-900 text-white border-gray-900" : "border-gray-200 text-gray-700 hover:border-gray-400"}`}>
+                      {label}
+                      {checked && <CheckCircle2 size={15} />}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div>
               <label className="block text-xs font-semibold uppercase tracking-wide text-gray-400 mb-1.5">Année construction</label>
               <input type="number" min="1800" max="2026" value={bien.anneeConstruction}
                 onChange={e => setBien(b => ({ ...b, anneeConstruction: e.target.value }))}
@@ -764,7 +859,7 @@ export default function TFAudit() {
               <p className="text-xs font-semibold text-blue-700 mb-1">Ce qui est vérifié à l'euro près</p>
               <p className="text-xs text-blue-600 leading-relaxed">Le calcul base × taux + frais de gestion légaux (art. 1641 CGI) est recalculé et comparé au montant affiché sur l'avis.</p>
               <p className="text-xs font-semibold text-blue-700 mt-2 mb-1">Ce qui reste à vérifier manuellement</p>
-              <p className="text-xs text-blue-600 leading-relaxed">Que les taux appliqués sont bien les taux votés cette année par les collectivités (impots.gouv.fr / mairie), et que la valeur locative elle-même est correcte (fiche d'évaluation 6660, sur demande au CDIF).</p>
+              <p className="text-xs text-blue-600 leading-relaxed">Que les taux appliqués sont bien les taux votés cette année par les collectivités (impots.gouv.fr / mairie), et que la valeur locative elle-même est correcte (fiche d'évaluation cadastrale, à demander gratuitement au CDIF).</p>
             </div>
 
             <div className="bg-white rounded-xl border border-gray-200 p-4">
@@ -803,8 +898,8 @@ export default function TFAudit() {
             {letter && (
               <div className="bg-white rounded-xl border border-gray-200 p-4">
                 <div className="flex items-center justify-between mb-3">
-                  <p className="text-xs font-semibold uppercase tracking-wide text-gray-400">Courrier — demande de fiche 6660</p>
-                  <button onClick={() => downloadText(letter, "demande-fiche-6660.txt")} className="flex items-center gap-1.5 text-xs border border-gray-300 px-3 py-1.5 rounded-lg hover:bg-gray-50 text-gray-700">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-gray-400">Courrier — demande de fiche d'évaluation cadastrale</p>
+                  <button onClick={() => downloadText(letter, "demande-fiche-evaluation-cadastrale.txt")} className="flex items-center gap-1.5 text-xs border border-gray-300 px-3 py-1.5 rounded-lg hover:bg-gray-50 text-gray-700">
                     <Download size={12} /> Télécharger
                   </button>
                 </div>
@@ -830,35 +925,39 @@ export default function TFAudit() {
               <div className="bg-green-50 border border-green-200 rounded-xl p-4">
                 <div className="flex items-center gap-2">
                   <CheckCircle2 size={16} className="text-green-600" />
-                  <p className="text-sm font-medium text-green-700">Aucune anomalie détectée</p>
+                  <p className="text-sm font-medium text-green-700">Arithmétique cohérente</p>
                 </div>
-                <p className="text-xs text-green-600 mt-1 leading-relaxed">Cela ne garantit pas que la valeur locative soit correcte — seule la fiche d'évaluation 6660 le confirme.</p>
+                <p className="text-xs text-green-600 mt-1 leading-relaxed">Aucune anomalie sur ce qui est vérifiable dans l'avis. Cela ne garantit pas que la valeur locative soit correcte — 30 à 40% des erreurs réelles se trouvent là, invisibles depuis l'avis seul. Seule la fiche d'évaluation cadastrale le confirme.</p>
               </div>
             )}
 
-            {result.score > 0 && (
-              <div className="bg-gray-900 rounded-xl p-5 text-white">
-                {!leadSent ? (
-                  <form onSubmit={submitLead} className="space-y-3">
-                    <p className="text-sm font-bold">On s'occupe de tout, vous ne payez qu'en cas de succès</p>
-                    <p className="text-xs text-gray-300 leading-relaxed">49€ de frais de dossier + 30% du remboursement obtenu. Notre expert-comptable partenaire monte le dossier, dépose la demande auprès du CDIF et suit le dégrèvement jusqu'au bout.</p>
-                    <div className="flex gap-2">
-                      <input type="email" required value={leadEmail} onChange={e => setLeadEmail(e.target.value)}
-                        placeholder="votre@email.fr"
-                        className="flex-1 bg-white/10 border border-white/20 rounded-lg px-3 py-2.5 text-sm placeholder-gray-400 focus:outline-none focus:border-white/50" />
-                      <button type="submit" className="bg-white text-gray-900 px-4 py-2.5 rounded-lg text-sm font-semibold hover:bg-gray-100 whitespace-nowrap">
-                        Être recontacté
-                      </button>
-                    </div>
-                  </form>
-                ) : (
-                  <div className="flex items-center gap-2">
-                    <CheckCircle2 size={18} className="text-green-400" />
-                    <p className="text-sm">Merci ! On revient vers vous sous 48h.</p>
+            <div className="bg-gray-900 rounded-xl p-5 text-white">
+              {!leadSent ? (
+                <form onSubmit={submitLead} className="space-y-3">
+                  <p className="text-sm font-bold">
+                    {result.score > 0 ? "On s'occupe de tout, vous ne payez qu'en cas de succès" : "Vérifier aussi la valeur locative ?"}
+                  </p>
+                  <p className="text-xs text-gray-300 leading-relaxed">
+                    {result.score > 0
+                      ? "49€ de frais de dossier + 30% du remboursement obtenu. Notre expert-comptable partenaire monte le dossier, dépose la demande auprès du CDIF et suit le dégrèvement jusqu'au bout."
+                      : "L'arithmétique est saine, mais la vraie source d'erreur (surface, confort, état) reste invisible depuis l'avis. 49€ de frais de dossier + 30% du remboursement obtenu si un écart réel est trouvé sur la valeur locative — rien si aucun écart n'est confirmé."}
+                  </p>
+                  <div className="flex gap-2">
+                    <input type="email" required value={leadEmail} onChange={e => setLeadEmail(e.target.value)}
+                      placeholder="votre@email.fr"
+                      className="flex-1 bg-white/10 border border-white/20 rounded-lg px-3 py-2.5 text-sm placeholder-gray-400 focus:outline-none focus:border-white/50" />
+                    <button type="submit" className="bg-white text-gray-900 px-4 py-2.5 rounded-lg text-sm font-semibold hover:bg-gray-100 whitespace-nowrap">
+                      Être recontacté
+                    </button>
                   </div>
-                )}
-              </div>
-            )}
+                </form>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 size={18} className="text-green-400" />
+                  <p className="text-sm">Merci ! On revient vers vous sous 48h.</p>
+                </div>
+              )}
+            </div>
           </>
         )}
       </div>
